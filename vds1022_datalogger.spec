@@ -14,6 +14,10 @@ block_cipher = None
 libusb_dir = Path(libusb_package.__file__).parent
 libusb_dll = libusb_dir / 'libusb-1.0.dll'
 
+# vds1022 パッケージのパスを取得（ファームウェア含む）
+import vds1022
+vds1022_dir = Path(vds1022.__file__).parent
+
 a = Analysis(
     ['main_gui.py'],
     pathex=[],
@@ -21,7 +25,12 @@ a = Analysis(
         # libusb DLLを実行ファイルと同じ場所に配置
         (str(libusb_dll), '.'),
     ],
-    datas=[],
+    datas=[
+        # libusb_package のデータリソース（DLLをパッケージとしても参照可能にする）
+        (str(libusb_dir), 'libusb_package'),
+        # vds1022 パッケージ全体（ファームウェア fwr/ を含む）
+        (str(vds1022_dir), 'vds1022'),
+    ],
     hiddenimports=[
         # vds1022
         'vds1022',

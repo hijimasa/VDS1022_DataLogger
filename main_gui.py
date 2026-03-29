@@ -33,30 +33,57 @@ pg.setConfigOptions(antialias=False, background='k', foreground='w', useOpenGL=T
 
 
 class AcquisitionThread(QThread):
-    """データ取得用スレッド"""
+    """データ取得用スレッド
+
+    AUTOモード: 50ms間隔で連続取得
+    NORMALモード: fetch()がトリガ待ちでブロック → 取得後にループ継続
+    SINGLEモード (single_shot=True): 1回取得したら自動停止
+    """
     waveform_ready = pyqtSignal(object)
     error_occurred = pyqtSignal(str)
+    finished_single = pyqtSignal()  # Single取得完了時にGUIへ通知
 
     def __init__(self, controller: VDS1022Controller):
         super().__init__()
         self.controller = controller
         self.running = False
-        self.interval = 0.05  # 50ms
+        self.single_shot = False  # 1回だけ取得して停止
+        self.interval = 0.05  # 50ms (AUTOモード用)
 
     def run(self):
         self.running = True
         while self.running:
             try:
+                # fetch()はNORMAL/ONCEモードではトリガ発火までブロックする
                 waveform = self.controller.acquire()
                 if waveform:
                     self.waveform_ready.emit(waveform)
             except Exception as e:
                 self.error_occurred.emit(str(e))
-            time.sleep(self.interval)
+
+            # 単発モード: 1回取得したら停止
+            if self.single_shot:
+                self.running = False
+                self.finished_single.emit()
+                break
+
+            # AUTOモードのみポーリング間隔を入れる
+            # NORMAL/ONCEはfetch()自体がブロックするので不要
+            if self.controller.trigger_mode == TriggerMode.AUTO:
+                time.sleep(self.interval)
 
     def stop(self):
         self.running = False
-        self.wait()
+        # NORMAL/ONCEモードでfetch()がブロック中の場合、
+        # デバイスにforce_triggerを送って解除する
+        if (not self.controller.simulation_mode
+                and self.controller.device
+                and self.controller.trigger_mode != TriggerMode.AUTO):
+            try:
+                self.controller.device.force_trigger()
+            except Exception:
+                pass
+        self.wait(5000)  # 最大5秒待ち
 
 
 class WaveformPlotWidget(pg.PlotWidget):
@@ -394,6 +421,7 @@ class SettingsPanel(QWidget):
         self.ch1_probe = QComboBox()
         self.ch1_probe.addItem("x1", 1)
         self.ch1_probe.addItem("x10", 10)
+        self.ch1_probe.setCurrentIndex(1)  # デフォルト x10
         self.ch1_probe.currentIndexChanged.connect(self._on_ch1_probe)
         ch_layout.addWidget(self.ch1_probe, 0, 6)
 
@@ -420,6 +448,7 @@ class SettingsPanel(QWidget):
         self.ch2_probe = QComboBox()
         self.ch2_probe.addItem("x1", 1)
         self.ch2_probe.addItem("x10", 10)
+        self.ch2_probe.setCurrentIndex(1)  # デフォルト x10
         self.ch2_probe.currentIndexChanged.connect(self._on_ch2_probe)
         ch_layout.addWidget(self.ch2_probe, 1, 6)
 
@@ -461,11 +490,13 @@ class SettingsPanel(QWidget):
         trig_layout.addWidget(QLabel("ソース:"), 0, 2)
         self.trigger_source = QComboBox()
         self.trigger_source.addItems(["CH1", "CH2"])
+        self.trigger_source.currentIndexChanged.connect(self._on_trigger_source)
         trig_layout.addWidget(self.trigger_source, 0, 3)
 
         trig_layout.addWidget(QLabel("エッジ:"), 1, 0)
         self.trigger_edge = QComboBox()
         self.trigger_edge.addItems(["立ち上がり", "立ち下がり"])
+        self.trigger_edge.currentIndexChanged.connect(self._on_trigger_edge)
         trig_layout.addWidget(self.trigger_edge, 1, 1)
 
         trig_layout.addWidget(QLabel("レベル:"), 1, 2)
@@ -473,6 +504,7 @@ class SettingsPanel(QWidget):
         self.trigger_level.setRange(-100, 100)
         self.trigger_level.setSingleStep(0.1)
         self.trigger_level.setSuffix(" V")
+        self.trigger_level.valueChanged.connect(self._on_trigger_level)
         trig_layout.addWidget(self.trigger_level, 1, 3)
 
         trig_group.setLayout(trig_layout)
@@ -673,6 +705,16 @@ class SettingsPanel(QWidget):
     def _on_trigger_mode(self, index):
         modes = [TriggerMode.AUTO, TriggerMode.NORMAL, TriggerMode.SINGLE]
         self.controller.set_trigger(mode=modes[index])
+
+    def _on_trigger_source(self, index):
+        self.controller.set_trigger(source=index + 1)  # 1=CH1, 2=CH2
+
+    def _on_trigger_edge(self, index):
+        edges = [TriggerEdge.RISING, TriggerEdge.FALLING]
+        self.controller.set_trigger(edge=edges[index])
+
+    def _on_trigger_level(self, value):
+        self.controller.set_trigger(level=value)
 
     def _on_waveform_type_changed(self, waveform_type: str):
         """波形タイプ変更時のUI切替"""
@@ -1295,7 +1337,11 @@ class DecodePanel(QWidget):
         self.btn_auto_thresh = QPushButton("スレッショルド自動")
         self.btn_auto_thresh.setToolTip("選択チャネルの (Vmax+Vmin)/2 を自動設定")
         self.btn_auto_thresh.clicked.connect(self._auto_threshold)
-        uart_layout.addWidget(self.btn_auto_thresh, row, 0, 1, 4)
+        uart_layout.addWidget(self.btn_auto_thresh, row, 0, 1, 2)
+
+        self.uart_invert = QCheckBox("信号反転")
+        self.uart_invert.setToolTip("RS-232レベル等アイドルLOWの信号に使用")
+        uart_layout.addWidget(self.uart_invert, row, 2, 1, 2)
 
         self.uart_cfg_group.setLayout(uart_layout)
         layout.addWidget(self.uart_cfg_group)
@@ -1655,6 +1701,7 @@ class DecodePanel(QWidget):
             data_bits=self.data_bits.currentData(),
             parity=parity_map[self.parity.currentText()],
             stop_bits=stop_map[self.stop_bits.currentText()],
+            invert=self.uart_invert.isChecked(),
         )
 
         try:
@@ -2024,6 +2071,7 @@ class MainWindow(QMainWindow):
 
         self.acq_thread.waveform_ready.connect(self._on_waveform_ready)
         self.acq_thread.error_occurred.connect(self._on_error)
+        self.acq_thread.finished_single.connect(self._on_single_finished)
 
         self.history_panel.show_history.toggled.connect(self._on_history_toggled)
         self.history_panel.load_waveform.connect(self._on_load_saved_waveform)
@@ -2050,19 +2098,33 @@ class MainWindow(QMainWindow):
     def _on_run_toggled(self, checked):
         """実行/停止"""
         if checked:
+            self.acq_thread.single_shot = False
             self.acq_thread.start()
             self.btn_run.setText("⏹ 停止")
-            self.statusBar().showMessage("取得中...")
+            self.btn_single.setEnabled(False)
+            mode_name = self.controller.trigger_mode.value
+            self.statusBar().showMessage(f"取得中... (トリガ: {mode_name})")
         else:
             self.acq_thread.stop()
             self.btn_run.setText("▶ 実行")
+            self.btn_single.setEnabled(True)
             self.statusBar().showMessage("停止")
 
     def _on_single(self):
-        """単発取得"""
-        waveform = self.controller.acquire()
-        if waveform:
-            self._on_waveform_ready(waveform)
+        """単発取得（スレッドで実行、トリガ待ちでGUIがフリーズしない）"""
+        if self.acq_thread.isRunning():
+            return
+        self.acq_thread.single_shot = True
+        self.btn_single.setEnabled(False)
+        self.btn_run.setEnabled(False)
+        self.statusBar().showMessage("トリガ待ち...")
+        self.acq_thread.start()
+
+    def _on_single_finished(self):
+        """単発取得完了時のUI復元"""
+        self.btn_single.setEnabled(True)
+        self.btn_run.setEnabled(True)
+        self.statusBar().showMessage("取得完了")
 
     def _on_waveform_ready(self, waveform: WaveformData):
         """波形データ受信"""

@@ -138,15 +138,21 @@ class UARTDecoder:
             if logic[i] == 1 and logic[i + 1] == 0:
                 frame_start = i + 1  # スタートビットの先頭インデックス
 
+                # スタートビット中央検証: 偽エッジ（ノイズ・リンギング）を排除
+                start_center = round(frame_start + spb * 0.5)
+                if start_center >= n or logic[start_center] != 0:
+                    i += 1
+                    continue
+
                 # データビットをsigrok方式で中央サンプリング
-                # データビット k の中央インデックス:
-                #   frame_start + spb * (k + 1.5)
-                #   = スタートビット1bit分 + kビット分 + 0.5ビット(中央)
+                # 基準点: スタートビット中央 (start_center)
+                # データビット k の中央: start_center + spb * (k + 1)
+                # ※ round()でビット中央に最も近いサンプルを選択
                 bits = []
                 valid = True
 
                 for k in range(self.data_bits):
-                    idx = int(frame_start + spb * (k + 1.5))
+                    idx = round(start_center + spb * (k + 1))
                     if idx >= n:
                         valid = False
                         break
@@ -158,50 +164,51 @@ class UARTDecoder:
 
                 # パリティビット検証
                 parity_ok = True
-                # bit_offset: start(1) + data_bits の次のビット番号
+                # bit_offset: data_bitsの次のビット番号（start_centerからの相対）
                 bit_offset = self.data_bits + 1
 
                 if self.parity != 'none':
-                    pidx = int(frame_start + spb * (bit_offset + 0.5))
+                    pidx = round(start_center + spb * bit_offset)
                     if pidx >= n:
                         i += 1
                         continue
                     parity_bit = int(logic[pidx])
                     ones = sum(bits)
                     if self.parity == 'even':
-                        # 偶数パリティ: 1の数 + パリティビットが偶数 → parity_bit = ones%2
                         parity_ok = (ones % 2) == parity_bit
                     else:  # 'odd'
-                        # 奇数パリティ: 1の数 + パリティビットが奇数 → parity_bit = 1 - ones%2
                         parity_ok = (ones % 2) != parity_bit
                     bit_offset += 1
 
-                # ストップビット確認（最初の1ビットのみ）
-                stop_idx = int(frame_start + spb * (bit_offset + 0.5))
+                # ストップビット確認（最初の1ビットの中央）
+                stop_idx = round(start_center + spb * bit_offset)
                 if stop_idx >= n:
                     i += 1
                     continue
                 frame_ok = (logic[stop_idx] == 1)  # ストップビットはHIGHであるべき
 
-                # フレーム終端インデックス
-                frame_end = int(frame_start + spb * (bit_offset + self.stop_bits))
-                frame_end = min(frame_end, n - 1)
+                # フレーム終端: ストップビットの先頭位置
+                # ※ back-to-backフレーム対応: ストップビットの先頭から
+                #   次のスタートビットのエッジ検出ができるようにする
+                stop_start = round(start_center + spb * (bit_offset - 0.5))
+                frame_end = min(stop_start, n - 1)
 
                 # バイト値を再構成（LSBファースト）
                 byte_val = sum(b << k for k, b in enumerate(bits))
 
                 frames.append(UARTFrame(
                     start_time=float(time_array[frame_start]),
-                    end_time=float(time_array[frame_end]),
+                    end_time=float(time_array[min(frame_end + round(spb * self.stop_bits), n - 1)]),
                     data=byte_val,
                     parity_ok=parity_ok,
                     frame_ok=frame_ok,
                     start_idx=frame_start,
-                    end_idx=frame_end,
+                    end_idx=min(frame_end + round(spb * self.stop_bits), n - 1),
                 ))
 
-                # このフレームの終端から検索を再開
-                i = frame_end + 1
+                # ストップビットの先頭から次のスタートエッジを探す
+                # （back-to-backフレーム: ストップビット直後に次のスタートが来る）
+                i = frame_end
             else:
                 i += 1
 
@@ -797,14 +804,20 @@ class CANDecoder:
                 sof_idx = i + 1
                 sof_time = float(time_array[sof_idx])
 
-                # SOFからビットストリームを収集
+                # SOF中央検証: 偽エッジ（ノイズ）を排除
+                sof_center = round(sof_idx + sp_offset)
+                if sof_center >= n or logic[sof_center] != 0:
+                    i += 1
+                    continue
+
+                # SOF中央を基準にビットストリームを収集
                 # 最大フレーム長: SOF(1) + ID(11) + RTR(1) + IDE(1) + r0(1) + DLC(4) +
                 #   DATA(64) + CRC(15) + CRC_DEL(1) + ACK(1) + ACK_DEL(1) + EOF(7) = 108
                 # スタッフビット込みで最大 108 + 108/5 ≒ 130 ビット
                 max_bits = 150
                 raw_bits = []
                 for k in range(max_bits):
-                    sample_idx = int(sof_idx + sp_offset + k * spb)
+                    sample_idx = round(sof_center + k * spb)
                     if sample_idx >= n:
                         break
                     raw_bits.append(int(logic[sample_idx]))
@@ -967,7 +980,7 @@ class CANDecoder:
         _tail = read_raw(10)
 
         # フレーム終端インデックス
-        end_idx = min(int(sof_idx + raw_pos * spb), len(time_array) - 1)
+        end_idx = min(round(sof_idx + raw_pos * spb), len(time_array) - 1)
         end_time = float(time_array[end_idx])
 
         return CANFrame(

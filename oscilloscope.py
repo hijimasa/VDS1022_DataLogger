@@ -11,26 +11,63 @@ import time
 
 
 def _setup_libusb_backend():
-    """libusb_packageのバックエンドを設定（Windows用）"""
+    """libusb バックエンドを設定（Windows用）
+
+    PyInstaller環境では libusb_package の importlib_resources が壊れるため、
+    exe と同じフォルダ（_internal/）にある libusb-1.0.dll を直接ロードする。
+    通常のPython環境では libusb_package 経由でバックエンドを取得する。
+    """
+    import sys
+    import os
+
+    try:
+        import usb.backend.libusb1
+    except ImportError:
+        return False
+
+    backend = None
+
+    # 1. libusb_package経由（通常のPython環境）
     try:
         import libusb_package
-        import usb.backend.libusb1
-
         backend = libusb_package.get_libusb1_backend()
-        if backend:
-            original_get_backend = usb.backend.libusb1.get_backend
-
-            def patched_get_backend(*args, **kwargs):
-                return backend
-
-            usb.backend.libusb1.get_backend = patched_get_backend
-            return True
-    except ImportError:
+    except (ImportError, Exception):
         pass
+
+    # 2. PyInstaller環境: exeの_internal/にあるDLLを直接指定
+    if backend is None:
+        dll_candidates = []
+        if getattr(sys, 'frozen', False):
+            # PyInstaller exe: sys._MEIPASS = _internal/ フォルダ
+            base = sys._MEIPASS
+            dll_candidates.append(os.path.join(base, 'libusb-1.0.dll'))
+        # カレントディレクトリも探す
+        dll_candidates.append(os.path.join(os.path.dirname(__file__), 'libusb-1.0.dll'))
+
+        for dll_path in dll_candidates:
+            if os.path.isfile(dll_path):
+                try:
+                    backend = usb.backend.libusb1.get_backend(
+                        find_library=lambda x: dll_path
+                    )
+                    if backend:
+                        break
+                except Exception:
+                    pass
+
+    if backend:
+        original_get_backend = usb.backend.libusb1.get_backend
+
+        def patched_get_backend(*args, **kwargs):
+            return backend
+
+        usb.backend.libusb1.get_backend = patched_get_backend
+        return True
+
     return False
 
 
-# Windows環境でlibusb_packageを使用
+# Windows環境でlibusbバックエンドを設定
 _setup_libusb_backend()
 
 
@@ -138,8 +175,8 @@ class VDS1022Controller:
         self.coupling_ch2 = Coupling.DC
         self.offset_ch1 = 0.0
         self.offset_ch2 = 0.0
-        self.probe_ratio_ch1 = 1  # 1x or 10x
-        self.probe_ratio_ch2 = 1
+        self.probe_ratio_ch1 = 10  # 1x or 10x
+        self.probe_ratio_ch2 = 10
 
         # タイムベース設定
         self.time_base = 1e-3  # s/div
@@ -180,6 +217,7 @@ class VDS1022Controller:
 
             # 初期チャネル設定
             self._apply_channel_settings()
+            self._apply_trigger_settings()
 
             self.connected = True
             print("VDS1022I に接続しました")
@@ -296,6 +334,41 @@ class VDS1022Controller:
         if edge is not None:
             self.trigger_edge = edge
 
+        # 実機にトリガ設定を適用
+        self._apply_trigger_settings()
+
+    def _apply_trigger_settings(self):
+        """実機にトリガー設定を適用"""
+        if not self.device or self.simulation_mode:
+            return
+
+        try:
+            from vds1022.vds1022 import CH1, CH2, EDGE, RISE, FALL, AUTO, NORMAL, ONCE
+
+            # ソース: 1→CH1, 2→CH2
+            source = CH1 if self.trigger_source == 1 else CH2
+
+            # エッジ: 立ち上がり/立ち下がり
+            condition = RISE if self.trigger_edge == TriggerEdge.RISING else FALL
+
+            # スイープモード: Auto/Normal/Single
+            sweep_map = {
+                TriggerMode.AUTO: AUTO,
+                TriggerMode.NORMAL: NORMAL,
+                TriggerMode.SINGLE: ONCE,
+            }
+            sweep = sweep_map[self.trigger_mode]
+
+            self.device.set_trigger(
+                source,
+                mode=EDGE,
+                condition=condition,
+                level=self.trigger_level,
+                sweep=sweep,
+            )
+        except Exception as e:
+            print(f"トリガー設定エラー: {e}")
+
     def acquire(self) -> Optional[WaveformData]:
         """波形データを取得"""
         if not self.connected:
@@ -305,7 +378,12 @@ class VDS1022Controller:
             return self._generate_simulation_data()
 
         try:
+            # ONCE/NORMALモードではfetch前にトリガを再セット（前回の発火済み状態をリセット）
+            if self.trigger_mode in (TriggerMode.SINGLE, TriggerMode.NORMAL):
+                self._apply_trigger_settings()
+
             # 実機からデータ取得 (vds1022ライブラリのfetch APIを使用)
+            # ONCE/NORMALモードではトリガ発火までブロックする
             frames = self.device.fetch()
 
             # to_numpy() で [2, N] の配列を取得

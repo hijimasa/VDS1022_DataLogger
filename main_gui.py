@@ -390,6 +390,13 @@ class SettingsPanel(QWidget):
         self.ch1_coupling.addItems(["DC", "AC", "GND"])
         ch_layout.addWidget(self.ch1_coupling, 0, 4)
 
+        ch_layout.addWidget(QLabel("プローブ:"), 0, 5)
+        self.ch1_probe = QComboBox()
+        self.ch1_probe.addItem("x1", 1)
+        self.ch1_probe.addItem("x10", 10)
+        self.ch1_probe.currentIndexChanged.connect(self._on_ch1_probe)
+        ch_layout.addWidget(self.ch1_probe, 0, 6)
+
         # CH2
         self.ch2_enabled = QCheckBox("CH2 有効")
         self.ch2_enabled.setChecked(False)
@@ -408,6 +415,13 @@ class SettingsPanel(QWidget):
         self.ch2_coupling = QComboBox()
         self.ch2_coupling.addItems(["DC", "AC", "GND"])
         ch_layout.addWidget(self.ch2_coupling, 1, 4)
+
+        ch_layout.addWidget(QLabel("プローブ:"), 1, 5)
+        self.ch2_probe = QComboBox()
+        self.ch2_probe.addItem("x1", 1)
+        self.ch2_probe.addItem("x10", 10)
+        self.ch2_probe.currentIndexChanged.connect(self._on_ch2_probe)
+        ch_layout.addWidget(self.ch2_probe, 1, 6)
 
         ch_group.setLayout(ch_layout)
         layout.addWidget(ch_group)
@@ -639,6 +653,16 @@ class SettingsPanel(QWidget):
     def _on_ch2_range(self, index):
         voltage = self.ch2_range.itemData(index)
         self.controller.set_voltage_range(2, voltage)
+        self.settings_changed.emit()
+
+    def _on_ch1_probe(self, index):
+        ratio = self.ch1_probe.itemData(index)
+        self.controller.set_probe_ratio(1, ratio)
+        self.settings_changed.emit()
+
+    def _on_ch2_probe(self, index):
+        ratio = self.ch2_probe.itemData(index)
+        self.controller.set_probe_ratio(2, ratio)
         self.settings_changed.emit()
 
     def _on_time_base(self, index):

@@ -240,6 +240,16 @@ class VDS1022Controller:
         # 実機に設定を適用
         self._apply_channel_settings()
 
+    def set_probe_ratio(self, channel: int, ratio: int):
+        """プローブ倍率を設定 (1 or 10)"""
+        if channel == 1:
+            self.probe_ratio_ch1 = ratio
+        else:
+            self.probe_ratio_ch2 = ratio
+
+        # 実機に設定を適用
+        self._apply_channel_settings()
+
     def set_voltage_range(self, channel: int, voltage_range: float):
         """電圧レンジを設定 (V/div)"""
         if channel == 1:
@@ -314,10 +324,16 @@ class VDS1022Controller:
             # CH1データは2行目 (index 1)
             if data.shape[0] >= 2 and self.ch1_enabled:
                 ch1_data = data[1]
+                # プローブ倍率補正: x10プローブは信号を1/10に減衰するため、
+                # 実際の電圧を得るにはprobe_ratio倍する
+                if self.probe_ratio_ch1 > 1:
+                    ch1_data = ch1_data * float(self.probe_ratio_ch1)
 
             # CH2データは3行目 (index 2) - 両チャネル有効時のみ
             if data.shape[0] >= 3 and self.ch2_enabled:
                 ch2_data = data[2]
+                if self.probe_ratio_ch2 > 1:
+                    ch2_data = ch2_data * float(self.probe_ratio_ch2)
 
             # サンプリングレートを取得 (プロパティ)
             actual_sample_rate = self.device.sampling_rate
@@ -328,8 +344,8 @@ class VDS1022Controller:
                 ch1_data=ch1_data,
                 ch2_data=ch2_data,
                 sample_rate=actual_sample_rate,
-                voltage_range_ch1=self.voltage_range_ch1,
-                voltage_range_ch2=self.voltage_range_ch2,
+                voltage_range_ch1=self.voltage_range_ch1 * self.probe_ratio_ch1,
+                voltage_range_ch2=self.voltage_range_ch2 * self.probe_ratio_ch2,
             )
         except Exception as e:
             print(f"データ取得エラー: {e}")
@@ -367,10 +383,14 @@ class VDS1022Controller:
             # CH1データは2行目 (index 1)
             if data.shape[0] >= 2 and self.ch1_enabled:
                 ch1_data = data[1]
+                if self.probe_ratio_ch1 > 1:
+                    ch1_data = ch1_data * float(self.probe_ratio_ch1)
 
             # CH2データは3行目 (index 2) - 両チャネル有効時のみ
             if data.shape[0] >= 3 and self.ch2_enabled:
                 ch2_data = data[2]
+                if self.probe_ratio_ch2 > 1:
+                    ch2_data = ch2_data * float(self.probe_ratio_ch2)
 
             # サンプリングレートを取得
             actual_sample_rate = self.device.sampling_rate
@@ -381,8 +401,8 @@ class VDS1022Controller:
                 ch1_data=ch1_data,
                 ch2_data=ch2_data,
                 sample_rate=actual_sample_rate,
-                voltage_range_ch1=self.voltage_range_ch1,
-                voltage_range_ch2=self.voltage_range_ch2,
+                voltage_range_ch1=self.voltage_range_ch1 * self.probe_ratio_ch1,
+                voltage_range_ch2=self.voltage_range_ch2 * self.probe_ratio_ch2,
             )
         except Exception as e:
             print(f"連続データ取得エラー: {e}")

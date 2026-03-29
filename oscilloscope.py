@@ -161,6 +161,12 @@ class VDS1022Controller:
         self._sim_i2c_address = 0x68   # スレーブアドレス（7bit）例: MPU-6050
         self._sim_i2c_data = b'\x00\x01\x02'
         self._sim_i2c_freq = 100000    # Hz (Standard=100kHz)
+        self._sim_spi_data = b'\xA5\x3C\x00'
+        self._sim_spi_freq = 100000    # Hz
+        self._sim_spi_mode = 0         # Mode 0 (CPOL=0, CPHA=0)
+        self._sim_can_id = 0x123       # 11ビットID
+        self._sim_can_data = b'\x01\x02\x03\x04'
+        self._sim_can_bitrate = 250000 # bps
 
     def connect(self) -> bool:
         """オシロスコープに接続"""
@@ -432,6 +438,26 @@ class VDS1022Controller:
             if self.ch2_enabled:
                 ch2_data = scl + np.random.normal(0, noise, num_samples)
                 ch2_data += self.offset_ch2
+        elif self._sim_waveform == "spi":
+            # SPI: CH1=SCLK, CH2=MOSI を同時生成
+            sclk, mosi = self._generate_spi_signal(time_array)
+            noise = self._sim_noise_level * 0.05
+            if self.ch1_enabled:
+                ch1_data = sclk + np.random.normal(0, noise, num_samples)
+                ch1_data += self.offset_ch1
+            if self.ch2_enabled:
+                ch2_data = mosi + np.random.normal(0, noise, num_samples)
+                ch2_data += self.offset_ch2
+        elif self._sim_waveform == "can":
+            # CAN: CH1=CAN信号（1チャネル）
+            can_sig = self._generate_can_signal(time_array)
+            noise = self._sim_noise_level * 0.05
+            if self.ch1_enabled:
+                ch1_data = can_sig + np.random.normal(0, noise, num_samples)
+                ch1_data += self.offset_ch1
+            if self.ch2_enabled:
+                ch2_data = can_sig + np.random.normal(0, noise, num_samples)
+                ch2_data += self.offset_ch2
         else:
             if self.ch1_enabled:
                 if self._sim_waveform == "uart":
@@ -606,11 +632,173 @@ class VDS1022Controller:
 
         return sda, scl
 
+    def _generate_spi_signal(self, time_array: np.ndarray,
+                              v_high: float = 3.3, v_low: float = 0.0) -> tuple:
+        """
+        SPI信号を生成（シミュレーション用）
+
+        CH1=SCLK, CH2=MOSI として使用する。
+        SCLKアイドル期間でトランザクションを区切る。
+
+        Args:
+            time_array: 時間配列（秒）
+            v_high: HIGH電圧（V）
+            v_low: LOW電圧（V）
+
+        Returns:
+            (sclk_array, mosi_array): SCLK信号とMOSI信号の電圧配列
+        """
+        n = len(time_array)
+        cpol = (self._sim_spi_mode >> 1) & 1
+        cpha = self._sim_spi_mode & 1
+        idle_v = v_high if cpol else v_low
+
+        sclk = np.full(n, idle_v, dtype=np.float64)
+        mosi = np.full(n, v_low, dtype=np.float64)
+
+        freq = self._sim_spi_freq
+        hp = 1.0 / (2.0 * freq)  # ハーフクロック周期
+
+        def set_range(arr, t0, t1, v):
+            if t0 >= time_array[-1]:
+                return
+            i0 = int(np.searchsorted(time_array, t0))
+            i1 = min(int(np.searchsorted(time_array, t1)), n)
+            if i0 < i1:
+                arr[i0:i1] = v
+
+        t = hp * 2  # アイドル期間
+
+        for byte_val in self._sim_spi_data:
+            if t >= time_array[-1]:
+                break
+
+            for bit_pos in range(7, -1, -1):  # MSBファースト
+                if t >= time_array[-1]:
+                    break
+                bit_v = v_high if ((byte_val >> bit_pos) & 1) else v_low
+
+                if cpha == 0:
+                    # CPHA=0: leadingエッジでサンプリング
+                    # データをleadingエッジ前にセット
+                    set_range(mosi, t, t + 2 * hp, bit_v)
+                    # leading edge
+                    leading_v = v_high if cpol == 0 else v_low
+                    trailing_v = idle_v
+                    set_range(sclk, t, t + hp, leading_v)
+                    set_range(sclk, t + hp, t + 2 * hp, trailing_v)
+                else:
+                    # CPHA=1: trailingエッジでサンプリング
+                    # leading edge（データ遷移用）
+                    leading_v = v_high if cpol == 0 else v_low
+                    trailing_v = idle_v
+                    set_range(sclk, t, t + hp, leading_v)
+                    # データをtrailingエッジ前にセット
+                    set_range(mosi, t, t + 2 * hp, bit_v)
+                    # trailing edge
+                    set_range(sclk, t + hp, t + 2 * hp, trailing_v)
+
+                t += 2 * hp
+
+            # バイト間アイドル（2クロック分）
+            set_range(sclk, t, t + 4 * hp, idle_v)
+            set_range(mosi, t, t + 4 * hp, v_low)
+            t += 4 * hp
+
+        return sclk, mosi
+
+    def _generate_can_signal(self, time_array: np.ndarray,
+                              v_recessive: float = 3.3,
+                              v_dominant: float = 0.0) -> np.ndarray:
+        """
+        CAN信号を生成（シミュレーション用）
+
+        ビットスタッフィングを含む標準CANデータフレームを生成。
+        CAN: リセッシブ=HIGH, ドミナント=LOW（NRZ符号）。
+
+        Args:
+            time_array: 時間配列（秒）
+            v_recessive: リセッシブ電圧（V）= HIGH
+            v_dominant: ドミナント電圧（V）= LOW
+
+        Returns:
+            CAN信号の電圧配列
+        """
+        from signal_decoder import _crc15_can, _stuff_bits
+
+        n = len(time_array)
+        signal = np.full(n, v_recessive, dtype=np.float64)
+
+        bitrate = self._sim_can_bitrate
+        bit_period = 1.0 / bitrate
+        can_id = self._sim_can_id & 0x7FF  # 11ビット標準
+        can_data = self._sim_can_data[:8]
+        dlc = len(can_data)
+
+        # フレームビット列を構築（スタッフィング前）
+        frame_bits = []
+        # SOF (1ビット ドミナント)
+        frame_bits.append(0)
+        # アービトレーションID (11ビット MSBファースト)
+        for k in range(10, -1, -1):
+            frame_bits.append((can_id >> k) & 1)
+        # RTR (0=データフレーム)
+        frame_bits.append(0)
+        # IDE (0=標準フレーム)
+        frame_bits.append(0)
+        # r0 (予約=0)
+        frame_bits.append(0)
+        # DLC (4ビット)
+        for k in range(3, -1, -1):
+            frame_bits.append((dlc >> k) & 1)
+        # データフィールド
+        for byte_val in can_data:
+            for k in range(7, -1, -1):
+                frame_bits.append((byte_val >> k) & 1)
+
+        # CRC計算（SOFからデータ末尾まで）
+        crc = _crc15_can(frame_bits)
+        # CRCフィールド (15ビット)
+        for k in range(14, -1, -1):
+            frame_bits.append((crc >> k) & 1)
+
+        # ビットスタッフィング適用（SOFからCRC末尾まで）
+        stuffed_bits = _stuff_bits(frame_bits)
+
+        # CRCデリミタ (1ビット リセッシブ) — スタッフィング対象外
+        stuffed_bits.append(1)
+        # ACKスロット (1ビット ドミナント=ACK応答あり)
+        stuffed_bits.append(0)
+        # ACKデリミタ (1ビット リセッシブ)
+        stuffed_bits.append(1)
+        # EOF (7ビット リセッシブ)
+        stuffed_bits.extend([1] * 7)
+        # IFS (3ビット リセッシブ: インターフレームスペース)
+        stuffed_bits.extend([1] * 3)
+
+        # ビット列を信号に変換
+        t_start = bit_period * 5  # 先頭にアイドル期間
+        for k, bit_val in enumerate(stuffed_bits):
+            t0 = t_start + k * bit_period
+            t1 = t0 + bit_period
+            if t0 >= time_array[-1]:
+                break
+            i0 = int(np.searchsorted(time_array, t0))
+            i1 = min(int(np.searchsorted(time_array, t1)), n)
+            if i0 < i1:
+                signal[i0:i1] = v_dominant if bit_val == 0 else v_recessive
+
+        return signal
+
     def set_simulation_params(self, frequency: float = None, amplitude: float = None,
                               waveform: str = None, noise_level: float = None,
                               uart_baudrate: int = None, uart_message: bytes = None,
                               i2c_address: int = None, i2c_data: bytes = None,
-                              i2c_freq: int = None):
+                              i2c_freq: int = None,
+                              spi_data: bytes = None, spi_freq: int = None,
+                              spi_mode: int = None,
+                              can_id: int = None, can_data: bytes = None,
+                              can_bitrate: int = None):
         """シミュレーションパラメータを設定"""
         if frequency is not None:
             self._sim_frequency = frequency
@@ -630,6 +818,18 @@ class VDS1022Controller:
             self._sim_i2c_data = i2c_data
         if i2c_freq is not None:
             self._sim_i2c_freq = i2c_freq
+        if spi_data is not None:
+            self._sim_spi_data = spi_data
+        if spi_freq is not None:
+            self._sim_spi_freq = spi_freq
+        if spi_mode is not None:
+            self._sim_spi_mode = spi_mode
+        if can_id is not None:
+            self._sim_can_id = can_id
+        if can_data is not None:
+            self._sim_can_data = can_data
+        if can_bitrate is not None:
+            self._sim_can_bitrate = can_bitrate
 
     def get_status(self) -> dict:
         """現在のステータスを取得"""

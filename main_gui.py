@@ -24,7 +24,8 @@ import numpy as np
 
 from oscilloscope import VDS1022Controller, WaveformData, TriggerMode, TriggerEdge, Coupling
 from data_logger import DataLogger
-from signal_decoder import UARTDecoder, UARTFrame, I2CDecoder, I2CFrame
+from signal_decoder import (UARTDecoder, UARTFrame, I2CDecoder, I2CFrame,
+                            SPIDecoder, SPIFrame, CANDecoder, CANFrame)
 
 
 # pyqtgraph設定
@@ -485,7 +486,7 @@ class SettingsPanel(QWidget):
 
         sim_layout.addWidget(QLabel("波形:"), 1, 0)
         self.sim_waveform = QComboBox()
-        self.sim_waveform.addItems(["sine", "square", "triangle", "sawtooth", "uart", "i2c"])
+        self.sim_waveform.addItems(["sine", "square", "triangle", "sawtooth", "uart", "i2c", "spi", "can"])
         self.sim_waveform.currentTextChanged.connect(self._on_sim_changed)
         self.sim_waveform.currentTextChanged.connect(self._on_waveform_type_changed)
         sim_layout.addWidget(self.sim_waveform, 1, 1)
@@ -555,6 +556,71 @@ class SettingsPanel(QWidget):
         self.i2c_sim_group.setVisible(False)
         layout.addWidget(self.i2c_sim_group)
 
+        # SPIシミュレーション設定（spi波形選択時のみ表示）
+        self.spi_sim_group = QGroupBox("SPIシミュレーション設定")
+        spi_sim_layout = QGridLayout()
+
+        spi_sim_layout.addWidget(QLabel("クロック:"), 0, 0)
+        self.sim_spi_freq = QComboBox()
+        for freq, lbl in [(100000, "100kHz"),
+                          (500000, "500kHz"),
+                          (1000000, "1MHz"),
+                          (2000000, "2MHz")]:
+            self.sim_spi_freq.addItem(lbl, freq)
+        self.sim_spi_freq.currentIndexChanged.connect(self._on_sim_changed)
+        spi_sim_layout.addWidget(self.sim_spi_freq, 0, 1)
+
+        spi_sim_layout.addWidget(QLabel("モード:"), 0, 2)
+        self.sim_spi_mode = QComboBox()
+        for m in range(4):
+            cpol = (m >> 1) & 1
+            cpha = m & 1
+            self.sim_spi_mode.addItem(f"Mode {m} (CPOL={cpol}, CPHA={cpha})", m)
+        self.sim_spi_mode.currentIndexChanged.connect(self._on_sim_changed)
+        spi_sim_layout.addWidget(self.sim_spi_mode, 0, 3)
+
+        spi_sim_layout.addWidget(QLabel("データ(HEX):"), 1, 0)
+        self.sim_spi_data = QLineEdit("A5 3C 00")
+        self.sim_spi_data.setPlaceholderText("スペース区切り HEX (例: A5 3C 00)")
+        self.sim_spi_data.textChanged.connect(self._on_sim_changed)
+        spi_sim_layout.addWidget(self.sim_spi_data, 1, 1, 1, 3)
+
+        self.spi_sim_group.setLayout(spi_sim_layout)
+        self.spi_sim_group.setVisible(False)
+        layout.addWidget(self.spi_sim_group)
+
+        # CANシミュレーション設定（can波形選択時のみ表示）
+        self.can_sim_group = QGroupBox("CANシミュレーション設定")
+        can_sim_layout = QGridLayout()
+
+        can_sim_layout.addWidget(QLabel("ビットレート:"), 0, 0)
+        self.sim_can_bitrate = QComboBox()
+        for br, lbl in [(125000, "125kbps"), (250000, "250kbps"),
+                         (500000, "500kbps"), (1000000, "1Mbps")]:
+            self.sim_can_bitrate.addItem(lbl, br)
+        self.sim_can_bitrate.setCurrentIndex(1)  # 250kbps
+        self.sim_can_bitrate.currentIndexChanged.connect(self._on_sim_changed)
+        can_sim_layout.addWidget(self.sim_can_bitrate, 0, 1)
+
+        can_sim_layout.addWidget(QLabel("ID (11bit HEX):"), 0, 2)
+        self.sim_can_id = QSpinBox()
+        self.sim_can_id.setRange(0, 0x7FF)
+        self.sim_can_id.setValue(0x123)
+        self.sim_can_id.setDisplayIntegerBase(16)
+        self.sim_can_id.setPrefix("0x")
+        self.sim_can_id.valueChanged.connect(self._on_sim_changed)
+        can_sim_layout.addWidget(self.sim_can_id, 0, 3)
+
+        can_sim_layout.addWidget(QLabel("データ(HEX):"), 1, 0)
+        self.sim_can_data = QLineEdit("01 02 03 04")
+        self.sim_can_data.setPlaceholderText("スペース区切り HEX (最大8バイト)")
+        self.sim_can_data.textChanged.connect(self._on_sim_changed)
+        can_sim_layout.addWidget(self.sim_can_data, 1, 1, 1, 3)
+
+        self.can_sim_group.setLayout(can_sim_layout)
+        self.can_sim_group.setVisible(False)
+        layout.addWidget(self.can_sim_group)
+
         layout.addStretch()
 
     def _on_ch1_enabled(self, enabled):
@@ -588,6 +654,8 @@ class SettingsPanel(QWidget):
         """波形タイプ変更時のUI切替"""
         self.uart_sim_group.setVisible(waveform_type == "uart")
         self.i2c_sim_group.setVisible(waveform_type == "i2c")
+        self.spi_sim_group.setVisible(waveform_type == "spi")
+        self.can_sim_group.setVisible(waveform_type == "can")
 
     def _on_sim_changed(self):
         # UARTメッセージのエスケープシーケンスを解釈
@@ -600,6 +668,18 @@ class SettingsPanel(QWidget):
         except ValueError:
             i2c_data = b'\x00'
 
+        # SPIデータ（スペース区切りHEX文字列をbytesに変換）
+        try:
+            spi_data = bytes(int(x, 16) for x in self.sim_spi_data.text().split() if x)
+        except ValueError:
+            spi_data = b'\xA5'
+
+        # CANデータ（スペース区切りHEX文字列をbytesに変換、最大8バイト）
+        try:
+            can_data = bytes(int(x, 16) for x in self.sim_can_data.text().split() if x)[:8]
+        except ValueError:
+            can_data = b'\x01'
+
         self.controller.set_simulation_params(
             frequency=self.sim_freq.value(),
             amplitude=self.sim_amp.value(),
@@ -610,6 +690,12 @@ class SettingsPanel(QWidget):
             i2c_address=self.sim_i2c_address.value(),
             i2c_data=i2c_data,
             i2c_freq=self.sim_i2c_freq.currentData(),
+            spi_data=spi_data,
+            spi_freq=self.sim_spi_freq.currentData(),
+            spi_mode=self.sim_spi_mode.currentData(),
+            can_id=self.sim_can_id.value(),
+            can_data=can_data,
+            can_bitrate=self.sim_can_bitrate.currentData(),
         )
 
 
@@ -1115,8 +1201,8 @@ class LoggingPanel(QWidget):
 
 
 class DecodePanel(QWidget):
-    """信号デコードパネル（UART / I2C プロトコルデコード）"""
-    decode_completed = pyqtSignal(list)    # List[UARTFrame or I2CFrame]
+    """信号デコードパネル（UART / I2C / SPI / CAN プロトコルデコード）"""
+    decode_completed = pyqtSignal(list)    # List[UARTFrame or I2CFrame or SPIFrame or CANFrame]
     fit_waveform = pyqtSignal(object)      # デコード後に波形全体を自動フィット
 
     def __init__(self):
@@ -1131,7 +1217,7 @@ class DecodePanel(QWidget):
         proto_layout = QHBoxLayout()
         proto_layout.addWidget(QLabel("プロトコル:"))
         self.protocol = QComboBox()
-        self.protocol.addItems(["UART", "I2C"])
+        self.protocol.addItems(["UART", "I2C", "SPI", "CAN"])
         self.protocol.currentTextChanged.connect(self._on_protocol_changed)
         proto_layout.addWidget(self.protocol)
         proto_layout.addStretch()
@@ -1243,6 +1329,121 @@ class DecodePanel(QWidget):
         self.i2c_cfg_group.setVisible(False)
         layout.addWidget(self.i2c_cfg_group)
 
+        # ---- SPI 設定グループ ----
+        self.spi_cfg_group = QGroupBox("SPI設定")
+        spi_layout = QGridLayout()
+
+        row = 0
+        spi_layout.addWidget(QLabel("SCLK チャネル:"), row, 0)
+        self.spi_sclk_ch = QComboBox()
+        self.spi_sclk_ch.addItems(["CH1", "CH2"])
+        spi_layout.addWidget(self.spi_sclk_ch, row, 1)
+
+        spi_layout.addWidget(QLabel("DATA チャネル:"), row, 2)
+        self.spi_data_ch = QComboBox()
+        self.spi_data_ch.addItems(["CH2", "CH1"])
+        spi_layout.addWidget(self.spi_data_ch, row, 3)
+
+        row += 1
+        spi_layout.addWidget(QLabel("データ種別:"), row, 0)
+        self.spi_data_label = QComboBox()
+        self.spi_data_label.addItems(["MOSI", "MISO"])
+        spi_layout.addWidget(self.spi_data_label, row, 1)
+
+        spi_layout.addWidget(QLabel("SPIモード:"), row, 2)
+        self.spi_mode = QComboBox()
+        for m in range(4):
+            cpol = (m >> 1) & 1
+            cpha = m & 1
+            self.spi_mode.addItem(f"Mode {m} (CPOL={cpol}, CPHA={cpha})", m)
+        spi_layout.addWidget(self.spi_mode, row, 3)
+
+        row += 1
+        spi_layout.addWidget(QLabel("ビット順序:"), row, 0)
+        self.spi_bit_order = QComboBox()
+        self.spi_bit_order.addItems(["MSBファースト", "LSBファースト"])
+        spi_layout.addWidget(self.spi_bit_order, row, 1)
+
+        spi_layout.addWidget(QLabel("データビット:"), row, 2)
+        self.spi_data_bits = QComboBox()
+        for db in [8, 16]:
+            self.spi_data_bits.addItem(str(db), db)
+        spi_layout.addWidget(self.spi_data_bits, row, 3)
+
+        row += 1
+        spi_layout.addWidget(QLabel("SCLK スレッショルド:"), row, 0)
+        self.spi_sclk_threshold = QDoubleSpinBox()
+        self.spi_sclk_threshold.setRange(-50.0, 50.0)
+        self.spi_sclk_threshold.setValue(1.65)
+        self.spi_sclk_threshold.setSingleStep(0.05)
+        self.spi_sclk_threshold.setSuffix(" V")
+        spi_layout.addWidget(self.spi_sclk_threshold, row, 1)
+
+        self.btn_auto_sclk = QPushButton("自動")
+        self.btn_auto_sclk.setToolTip("SCLKチャネルの (Vmax+Vmin)/2 を自動設定")
+        self.btn_auto_sclk.clicked.connect(self._auto_sclk_threshold)
+        spi_layout.addWidget(self.btn_auto_sclk, row, 2)
+
+        row += 1
+        spi_layout.addWidget(QLabel("DATA スレッショルド:"), row, 0)
+        self.spi_data_threshold = QDoubleSpinBox()
+        self.spi_data_threshold.setRange(-50.0, 50.0)
+        self.spi_data_threshold.setValue(1.65)
+        self.spi_data_threshold.setSingleStep(0.05)
+        self.spi_data_threshold.setSuffix(" V")
+        spi_layout.addWidget(self.spi_data_threshold, row, 1)
+
+        self.btn_auto_spi_data = QPushButton("自動")
+        self.btn_auto_spi_data.setToolTip("DATAチャネルの (Vmax+Vmin)/2 を自動設定")
+        self.btn_auto_spi_data.clicked.connect(self._auto_spi_data_threshold)
+        spi_layout.addWidget(self.btn_auto_spi_data, row, 2)
+
+        self.spi_cfg_group.setLayout(spi_layout)
+        self.spi_cfg_group.setVisible(False)
+        layout.addWidget(self.spi_cfg_group)
+
+        # ---- CAN 設定グループ ----
+        self.can_cfg_group = QGroupBox("CAN設定")
+        can_layout = QGridLayout()
+
+        row = 0
+        can_layout.addWidget(QLabel("チャネル:"), row, 0)
+        self.can_channel = QComboBox()
+        self.can_channel.addItems(["CH1", "CH2"])
+        can_layout.addWidget(self.can_channel, row, 1)
+
+        can_layout.addWidget(QLabel("ビットレート:"), row, 2)
+        self.can_bitrate = QComboBox()
+        for br, lbl in [(125000, "125kbps"), (250000, "250kbps"),
+                         (500000, "500kbps"), (1000000, "1Mbps")]:
+            self.can_bitrate.addItem(lbl, br)
+        self.can_bitrate.setCurrentIndex(1)  # 250kbps
+        can_layout.addWidget(self.can_bitrate, row, 3)
+
+        row += 1
+        can_layout.addWidget(QLabel("スレッショルド:"), row, 0)
+        self.can_threshold = QDoubleSpinBox()
+        self.can_threshold.setRange(-50.0, 50.0)
+        self.can_threshold.setValue(1.65)
+        self.can_threshold.setSingleStep(0.05)
+        self.can_threshold.setSuffix(" V")
+        can_layout.addWidget(self.can_threshold, row, 1)
+
+        self.btn_auto_can = QPushButton("自動")
+        self.btn_auto_can.setToolTip("選択チャネルの (Vmax+Vmin)/2 を自動設定")
+        self.btn_auto_can.clicked.connect(self._auto_can_threshold)
+        can_layout.addWidget(self.btn_auto_can, row, 2)
+
+        row += 1
+        can_layout.addWidget(QLabel("IDフィルタ:"), row, 0)
+        self.can_id_filter = QLineEdit()
+        self.can_id_filter.setPlaceholderText("空欄=全表示 / 例: 0x123")
+        can_layout.addWidget(self.can_id_filter, row, 1, 1, 3)
+
+        self.can_cfg_group.setLayout(can_layout)
+        self.can_cfg_group.setVisible(False)
+        layout.addWidget(self.can_cfg_group)
+
         # ---- デコードボタン ----
         self.btn_decode = QPushButton("デコード実行")
         self.btn_decode.setEnabled(False)
@@ -1275,9 +1476,10 @@ class DecodePanel(QWidget):
 
     def _on_protocol_changed(self, protocol: str):
         """プロトコル変更時: 設定グループとテーブル列を切替"""
-        is_uart = protocol == "UART"
-        self.uart_cfg_group.setVisible(is_uart)
-        self.i2c_cfg_group.setVisible(not is_uart)
+        self.uart_cfg_group.setVisible(protocol == "UART")
+        self.i2c_cfg_group.setVisible(protocol == "I2C")
+        self.spi_cfg_group.setVisible(protocol == "SPI")
+        self.can_cfg_group.setVisible(protocol == "CAN")
         self._setup_table_columns(protocol)
 
     def _setup_table_columns(self, protocol: str):
@@ -1295,6 +1497,18 @@ class DecodePanel(QWidget):
                 ["#", "種別", "時刻(s)", "アドレス/データ", "R/W", "ACK"])
             self.result_table.horizontalHeader().setSectionResizeMode(
                 3, QHeaderView.ResizeMode.Stretch)
+        elif protocol == "SPI":
+            self.result_table.setColumnCount(5)
+            self.result_table.setHorizontalHeaderLabels(
+                ["#", "時刻(s)", "HEX", "ASCII", "状態"])
+            self.result_table.horizontalHeader().setSectionResizeMode(
+                4, QHeaderView.ResizeMode.Stretch)
+        elif protocol == "CAN":
+            self.result_table.setColumnCount(6)
+            self.result_table.setHorizontalHeaderLabels(
+                ["#", "時刻(s)", "ID(HEX)", "DLC", "データ", "状態"])
+            self.result_table.horizontalHeader().setSectionResizeMode(
+                4, QHeaderView.ResizeMode.Stretch)
 
     # ------------------------------------------------------------------
     # 公開メソッド
@@ -1345,6 +1559,42 @@ class DecodePanel(QWidget):
         mid = (float(np.max(data)) + float(np.min(data))) / 2.0
         self.i2c_scl_threshold.setValue(round(mid, 3))
 
+    def _auto_sclk_threshold(self):
+        """SPI SCLK: 選択チャネルの中間電圧を自動設定"""
+        if self._current_waveform is None:
+            return
+        ch = 1 if self.spi_sclk_ch.currentText() == "CH1" else 2
+        data = self._current_waveform.ch1_data if ch == 1 else self._current_waveform.ch2_data
+        if data is None:
+            self.status_label.setText("SCLKチャネルにデータがありません")
+            return
+        mid = (float(np.max(data)) + float(np.min(data))) / 2.0
+        self.spi_sclk_threshold.setValue(round(mid, 3))
+
+    def _auto_spi_data_threshold(self):
+        """SPI DATA: 選択チャネルの中間電圧を自動設定"""
+        if self._current_waveform is None:
+            return
+        ch = 1 if self.spi_data_ch.currentText() == "CH1" else 2
+        data = self._current_waveform.ch1_data if ch == 1 else self._current_waveform.ch2_data
+        if data is None:
+            self.status_label.setText("DATAチャネルにデータがありません")
+            return
+        mid = (float(np.max(data)) + float(np.min(data))) / 2.0
+        self.spi_data_threshold.setValue(round(mid, 3))
+
+    def _auto_can_threshold(self):
+        """CAN: 選択チャネルの中間電圧を自動設定"""
+        if self._current_waveform is None:
+            return
+        ch = 1 if self.can_channel.currentText() == "CH1" else 2
+        data = self._current_waveform.ch1_data if ch == 1 else self._current_waveform.ch2_data
+        if data is None:
+            self.status_label.setText("選択チャネルにデータがありません")
+            return
+        mid = (float(np.max(data)) + float(np.min(data))) / 2.0
+        self.can_threshold.setValue(round(mid, 3))
+
     # ------------------------------------------------------------------
     # デコード実行
     # ------------------------------------------------------------------
@@ -1358,6 +1608,10 @@ class DecodePanel(QWidget):
             self._decode_uart()
         elif protocol == "I2C":
             self._decode_i2c()
+        elif protocol == "SPI":
+            self._decode_spi()
+        elif protocol == "CAN":
+            self._decode_can()
 
     def _decode_uart(self):
         """UARTデコード実行"""
@@ -1494,6 +1748,125 @@ class DecodePanel(QWidget):
         self.status_label.setText(
             f"{len(frames)} フレーム  "
             f"ADDR:{len(addr_frames)}  DATA:{len(data_frames)}  NACK:{nacks}"
+        )
+        self.decode_completed.emit(frames)
+        self.fit_waveform.emit(wf)
+
+    def _decode_spi(self):
+        """SPIデコード実行"""
+        wf = self._current_waveform
+        sclk_ch = 1 if self.spi_sclk_ch.currentText() == "CH1" else 2
+        data_ch = 1 if self.spi_data_ch.currentText() == "CH1" else 2
+
+        sclk_data = wf.ch1_data if sclk_ch == 1 else wf.ch2_data
+        data_data = wf.ch1_data if data_ch == 1 else wf.ch2_data
+
+        if sclk_data is None:
+            self.status_label.setText(
+                f"SCLK (CH{sclk_ch}) にデータがありません。チャネルを有効にしてください。")
+            return
+        if data_data is None:
+            self.status_label.setText(
+                f"DATA (CH{data_ch}) にデータがありません。チャネルを有効にしてください。")
+            return
+        if sclk_ch == data_ch:
+            self.status_label.setText("SCLKとDATAに異なるチャネルを選択してください")
+            return
+
+        bit_order_map = {"MSBファースト": "msb", "LSBファースト": "lsb"}
+        decoder = SPIDecoder(
+            mode=self.spi_mode.currentData(),
+            data_bits=self.spi_data_bits.currentData(),
+            bit_order=bit_order_map[self.spi_bit_order.currentText()],
+        )
+
+        try:
+            frames = decoder.decode(
+                wf.time_array, sclk_data, data_data,
+                sclk_threshold=self.spi_sclk_threshold.value(),
+                data_threshold=self.spi_data_threshold.value(),
+                data_label=self.spi_data_label.currentText(),
+            )
+        except ValueError as e:
+            self.status_label.setText(f"エラー: {e}")
+            return
+
+        # テーブル更新
+        self._setup_table_columns("SPI")
+        self.result_table.setRowCount(len(frames))
+        for row_idx, frame in enumerate(frames):
+            vals = [str(row_idx), f"{frame.start_time:.6f}",
+                    frame.hex_str, frame.ascii_str, frame.status]
+            for col, text in enumerate(vals):
+                item = QTableWidgetItem(text)
+                if frame.status != 'OK':
+                    item.setForeground(QColor(255, 100, 100))
+                self.result_table.setItem(row_idx, col, item)
+
+        n = len(frames)
+        err = sum(1 for f in frames if f.status != 'OK')
+        hex_preview = ' '.join(f.hex_str for f in frames[:20])
+        self.status_label.setText(
+            f"{n} フレーム ({frames[0].channel if frames else 'SPI'})  エラー: {err}"
+            + (f"\nHEX: {hex_preview}" if hex_preview else "")
+        )
+        self.decode_completed.emit(frames)
+        self.fit_waveform.emit(wf)
+
+    def _decode_can(self):
+        """CANデコード実行"""
+        wf = self._current_waveform
+        ch = 1 if self.can_channel.currentText() == "CH1" else 2
+        data = wf.ch1_data if ch == 1 else wf.ch2_data
+
+        if data is None:
+            self.status_label.setText(
+                f"CH{ch} にデータがありません。チャネルを有効にしてください。")
+            return
+
+        decoder = CANDecoder(
+            bitrate=self.can_bitrate.currentData(),
+        )
+
+        try:
+            frames = decoder.decode(wf.time_array, data,
+                                    threshold=self.can_threshold.value())
+        except ValueError as e:
+            self.status_label.setText(f"エラー: {e}")
+            return
+
+        # IDフィルタ
+        id_filter_text = self.can_id_filter.text().strip()
+        id_filter = None
+        if id_filter_text:
+            try:
+                id_filter = int(id_filter_text, 0)
+            except ValueError:
+                pass
+
+        display_frames = frames
+        if id_filter is not None:
+            display_frames = [f for f in frames if f.frame_id == id_filter]
+
+        # テーブル更新
+        self._setup_table_columns("CAN")
+        self.result_table.setRowCount(len(display_frames))
+        for row_idx, frame in enumerate(display_frames):
+            id_str = f"0x{frame.frame_id:03X}" if not frame.is_extended else f"0x{frame.frame_id:08X}"
+            data_str = frame.data_hex if not frame.is_remote else "RTR"
+            vals = [str(row_idx), f"{frame.start_time:.6f}",
+                    id_str, str(frame.dlc), data_str, frame.status]
+            for col, text in enumerate(vals):
+                item = QTableWidgetItem(text)
+                if frame.status != 'OK':
+                    item.setForeground(QColor(255, 100, 100))
+                self.result_table.setItem(row_idx, col, item)
+
+        n = len(frames)
+        crc_err = sum(1 for f in frames if not f.crc_ok)
+        stuff_err = sum(1 for f in frames if f.stuff_errors > 0)
+        self.status_label.setText(
+            f"{n} フレーム  CRCエラー:{crc_err}  スタッフエラー:{stuff_err}"
         )
         self.decode_completed.emit(frames)
         self.fit_waveform.emit(wf)

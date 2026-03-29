@@ -1,0 +1,15 @@
+# VDS1022I データロガー 依存パッケージ
+
+# GUI
+PyQt6>=6.4.0
+pyqtgraph>=0.13.0
+
+# 数値計算
+numpy>=1.21.0
+
+# USB通信 (Windows)
+pyusb>=1.2.0
+libusb-package>=1.0.26
+
+# VDS1022ドライバー (実機接続時に必要)
+# pip install git+https://github.com/florentbr/OWON-VDS1022.git#subdirectory=api/python

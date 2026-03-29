@@ -156,6 +156,8 @@ class VDS1022Controller:
         self._sim_amplitude = 2.0   # V
         self._sim_waveform = "sine"
         self._sim_noise_level = 0.05
+        self._sim_uart_baudrate = 9600
+        self._sim_uart_message = b"Hello\r\n"
 
     def connect(self) -> bool:
         """オシロスコープに接続"""
@@ -418,9 +420,13 @@ class VDS1022Controller:
         ch2_data = None
 
         if self.ch1_enabled:
-            ch1_data = self._generate_waveform(time_array, self._sim_frequency,
-                                                self._sim_amplitude, self._sim_waveform)
-            ch1_data += np.random.normal(0, self._sim_noise_level, num_samples)
+            if self._sim_waveform == "uart":
+                ch1_data = self._generate_uart_signal(time_array)
+                ch1_data += np.random.normal(0, self._sim_noise_level * 0.1, num_samples)
+            else:
+                ch1_data = self._generate_waveform(time_array, self._sim_frequency,
+                                                    self._sim_amplitude, self._sim_waveform)
+                ch1_data += np.random.normal(0, self._sim_noise_level, num_samples)
             ch1_data += self.offset_ch1
 
         if self.ch2_enabled:
@@ -456,8 +462,52 @@ class VDS1022Controller:
         else:
             return amplitude * np.sin(phase)
 
+    def _generate_uart_signal(self, time_array: np.ndarray,
+                               v_high: float = 3.3, v_low: float = 0.0) -> np.ndarray:
+        """
+        TTL UART信号を生成（シミュレーション用）
+
+        Args:
+            time_array: 時間配列（秒）
+            v_high: HIGH電圧（V）
+            v_low: LOW電圧（V）
+
+        Returns:
+            UART信号の電圧配列
+        """
+        signal = np.full(len(time_array), v_high, dtype=np.float64)
+
+        baudrate = self._sim_uart_baudrate
+        bit_period = 1.0 / baudrate
+
+        # 先頭に2ビット分のアイドル期間を設ける
+        t_cursor = bit_period * 2.0
+
+        for byte_val in self._sim_uart_message:
+            if t_cursor >= time_array[-1]:
+                break
+
+            # ビット列: スタートビット(LOW) + 8データビット(LSBファースト) + ストップビット(HIGH)
+            bit_levels = [0]  # START bit
+            for k in range(8):
+                bit_levels.append((byte_val >> k) & 1)
+            bit_levels.append(1)  # STOP bit
+
+            for level in bit_levels:
+                t_end = t_cursor + bit_period
+                i_start = int(np.searchsorted(time_array, t_cursor))
+                i_end = int(np.searchsorted(time_array, t_end))
+                signal[i_start:i_end] = v_high if level else v_low
+                t_cursor = t_end
+
+            # バイト間に1ビット分のアイドル時間
+            t_cursor += bit_period
+
+        return signal
+
     def set_simulation_params(self, frequency: float = None, amplitude: float = None,
-                              waveform: str = None, noise_level: float = None):
+                              waveform: str = None, noise_level: float = None,
+                              uart_baudrate: int = None, uart_message: bytes = None):
         """シミュレーションパラメータを設定"""
         if frequency is not None:
             self._sim_frequency = frequency
@@ -467,6 +517,10 @@ class VDS1022Controller:
             self._sim_waveform = waveform
         if noise_level is not None:
             self._sim_noise_level = noise_level
+        if uart_baudrate is not None:
+            self._sim_uart_baudrate = uart_baudrate
+        if uart_message is not None:
+            self._sim_uart_message = uart_message
 
     def get_status(self) -> dict:
         """現在のステータスを取得"""

@@ -14,7 +14,7 @@ from PyQt6.QtWidgets import (
     QGroupBox, QLabel, QPushButton, QComboBox, QSpinBox, QDoubleSpinBox,
     QCheckBox, QTabWidget, QFileDialog, QListWidget, QListWidgetItem,
     QSplitter, QStatusBar, QMessageBox, QSlider, QFrame, QGridLayout,
-    QLineEdit
+    QLineEdit, QTableWidget, QTableWidgetItem, QHeaderView
 )
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QThread
 from PyQt6.QtGui import QFont, QColor, QPalette
@@ -24,6 +24,7 @@ import numpy as np
 
 from oscilloscope import VDS1022Controller, WaveformData, TriggerMode, TriggerEdge, Coupling
 from data_logger import DataLogger
+from signal_decoder import UARTDecoder, UARTFrame
 
 
 # pyqtgraph設定
@@ -101,6 +102,9 @@ class WaveformPlotWidget(pg.PlotWidget):
         self.cursor_v.hide()
         self.cursor_h.hide()
 
+        # デコードオーバーレイアイテム
+        self._decode_items: List = []
+
         # X軸はドラッグでパン、Y軸はドラッグ無効
         self.getViewBox().setMouseMode(pg.ViewBox.PanMode)
         self.setMouseEnabled(x=True, y=False)
@@ -136,7 +140,8 @@ class WaveformPlotWidget(pg.PlotWidget):
         self._apply_y_range()
 
     def update_waveform(self, waveform: WaveformData):
-        """リアルタイム波形を更新（読み込み波形なし時のみY自動調整）"""
+        """リアルタイム波形を更新"""
+        self.clear_loaded_waveform()  # ビューアモードを解除してライブ表示に戻す
         if waveform.ch1_data is not None:
             self.ch1_curve.setData(waveform.time_array, waveform.ch1_data)
             self.ch1_curve.show()
@@ -264,6 +269,13 @@ class WaveformPlotWidget(pg.PlotWidget):
         # ドラッグ中は毎回_update_viewせず、止まってから100ms後に更新
         self._pan_timer.start()
 
+    def fit_to_data(self, waveform: WaveformData):
+        """波形データ全体がちょうど10divに収まるよう自動フィットしてビューアモードへ切替"""
+        duration = float(waveform.time_array[-1] - waveform.time_array[0])
+        self._time_base = max(duration / 10.0, 1e-9)  # 10divに収まるtimebase
+        self._y_center = 0.0
+        self.load_waveform_data(waveform)
+
     def clear_loaded_waveform(self):
         """読み込んだ波形データをクリア"""
         self._loaded_waveform = None
@@ -283,6 +295,57 @@ class WaveformPlotWidget(pg.PlotWidget):
         else:
             self.cursor_v.hide()
             self.cursor_h.hide()
+
+    def show_decode_overlay(self, frames: List):
+        """デコード結果をオーバーレイ表示（波形上に色付き領域とラベル）"""
+        self.clear_decode_overlay()
+
+        if not frames:
+            return
+
+        y_top = self._y_center + self._v_div * 3.5
+
+        for frame in frames:
+            # フレーム種別に応じた色設定
+            if not frame.frame_ok:
+                region_color = (200, 60, 60, 60)   # 赤: フレームエラー
+                text_color = (255, 100, 100)
+            elif not frame.parity_ok:
+                region_color = (200, 150, 0, 60)    # 黄: パリティエラー
+                text_color = (255, 200, 0)
+            else:
+                region_color = (60, 200, 100, 60)   # 緑: 正常
+                text_color = (100, 255, 150)
+
+            # 時間領域をハイライト
+            region = pg.LinearRegionItem(
+                values=[frame.start_time, frame.end_time],
+                movable=False,
+                brush=pg.mkBrush(*region_color),
+                pen=pg.mkPen(region_color[:3], width=1),
+            )
+            region.setZValue(-5)
+            self.addItem(region)
+            self._decode_items.append(region)
+
+            # HEX + ASCII ラベル
+            center_time = (frame.start_time + frame.end_time) / 2.0
+            label = f"{frame.hex_str}\n{frame.ascii_str}"
+            text_item = pg.TextItem(
+                label,
+                color=pg.mkColor(*text_color),
+                anchor=(0.5, 1.0),
+                fill=pg.mkBrush(0, 0, 0, 160),
+            )
+            text_item.setPos(center_time, y_top)
+            self.addItem(text_item)
+            self._decode_items.append(text_item)
+
+    def clear_decode_overlay(self):
+        """デコードオーバーレイをクリア"""
+        for item in self._decode_items:
+            self.removeItem(item)
+        self._decode_items.clear()
 
 
 class SettingsPanel(QWidget):
@@ -416,8 +479,9 @@ class SettingsPanel(QWidget):
 
         sim_layout.addWidget(QLabel("波形:"), 1, 0)
         self.sim_waveform = QComboBox()
-        self.sim_waveform.addItems(["sine", "square", "triangle", "sawtooth"])
+        self.sim_waveform.addItems(["sine", "square", "triangle", "sawtooth", "uart"])
         self.sim_waveform.currentTextChanged.connect(self._on_sim_changed)
+        self.sim_waveform.currentTextChanged.connect(self._on_waveform_type_changed)
         sim_layout.addWidget(self.sim_waveform, 1, 1)
 
         sim_layout.addWidget(QLabel("ノイズ:"), 1, 2)
@@ -430,6 +494,28 @@ class SettingsPanel(QWidget):
 
         sim_group.setLayout(sim_layout)
         layout.addWidget(sim_group)
+
+        # UARTシミュレーション設定（uart波形選択時のみ表示）
+        self.uart_sim_group = QGroupBox("UARTシミュレーション設定")
+        uart_layout = QGridLayout()
+
+        uart_layout.addWidget(QLabel("ボーレート:"), 0, 0)
+        self.sim_uart_baudrate = QComboBox()
+        for br in [300, 1200, 2400, 4800, 9600, 19200, 38400, 57600, 115200]:
+            self.sim_uart_baudrate.addItem(str(br), br)
+        self.sim_uart_baudrate.setCurrentText("9600")
+        self.sim_uart_baudrate.currentIndexChanged.connect(self._on_sim_changed)
+        uart_layout.addWidget(self.sim_uart_baudrate, 0, 1)
+
+        uart_layout.addWidget(QLabel("メッセージ:"), 1, 0)
+        self.sim_uart_message = QLineEdit("Hello\\r\\n")
+        self.sim_uart_message.setPlaceholderText("送信テキスト (\\r\\nも使用可)")
+        self.sim_uart_message.textChanged.connect(self._on_sim_changed)
+        uart_layout.addWidget(self.sim_uart_message, 1, 1)
+
+        self.uart_sim_group.setLayout(uart_layout)
+        self.uart_sim_group.setVisible(False)
+        layout.addWidget(self.uart_sim_group)
 
         layout.addStretch()
 
@@ -460,12 +546,22 @@ class SettingsPanel(QWidget):
         modes = [TriggerMode.AUTO, TriggerMode.NORMAL, TriggerMode.SINGLE]
         self.controller.set_trigger(mode=modes[index])
 
+    def _on_waveform_type_changed(self, waveform_type: str):
+        """波形タイプ変更時のUI切替"""
+        self.uart_sim_group.setVisible(waveform_type == "uart")
+
     def _on_sim_changed(self):
+        # UARTメッセージのエスケープシーケンスを解釈
+        raw_msg = self.sim_uart_message.text()
+        uart_msg = raw_msg.replace("\\r\\n", "\r\n").replace("\\r", "\r").replace("\\n", "\n")
+
         self.controller.set_simulation_params(
             frequency=self.sim_freq.value(),
             amplitude=self.sim_amp.value(),
             waveform=self.sim_waveform.currentText(),
-            noise_level=self.sim_noise.value()
+            noise_level=self.sim_noise.value(),
+            uart_baudrate=self.sim_uart_baudrate.currentData(),
+            uart_message=uart_msg.encode('utf-8', errors='replace'),
         )
 
 
@@ -970,6 +1066,188 @@ class LoggingPanel(QWidget):
                                     f"CSVファイルを保存しました:\n{filepath}")
 
 
+class DecodePanel(QWidget):
+    """信号デコードパネル（UARTプロトコルデコード）"""
+    decode_completed = pyqtSignal(list)    # List[UARTFrame]
+    fit_waveform = pyqtSignal(object)      # デコード後に波形全体を自動フィット
+
+    def __init__(self):
+        super().__init__()
+        self._current_waveform: Optional[WaveformData] = None
+        self._init_ui()
+
+    def _init_ui(self):
+        layout = QVBoxLayout(self)
+
+        # デコード設定
+        cfg_group = QGroupBox("デコード設定")
+        cfg_layout = QGridLayout()
+
+        row = 0
+        cfg_layout.addWidget(QLabel("プロトコル:"), row, 0)
+        self.protocol = QComboBox()
+        self.protocol.addItems(["UART"])
+        cfg_layout.addWidget(self.protocol, row, 1)
+
+        cfg_layout.addWidget(QLabel("チャネル:"), row, 2)
+        self.channel = QComboBox()
+        self.channel.addItems(["CH1", "CH2"])
+        cfg_layout.addWidget(self.channel, row, 3)
+
+        row += 1
+        cfg_layout.addWidget(QLabel("ボーレート:"), row, 0)
+        self.baudrate = QComboBox()
+        for br in UARTDecoder.STANDARD_BAUDRATES:
+            self.baudrate.addItem(str(br), br)
+        self.baudrate.setCurrentText("9600")
+        cfg_layout.addWidget(self.baudrate, row, 1)
+
+        cfg_layout.addWidget(QLabel("データビット:"), row, 2)
+        self.data_bits = QComboBox()
+        for db in [5, 6, 7, 8, 9]:
+            self.data_bits.addItem(str(db), db)
+        self.data_bits.setCurrentIndex(3)  # 8
+        cfg_layout.addWidget(self.data_bits, row, 3)
+
+        row += 1
+        cfg_layout.addWidget(QLabel("パリティ:"), row, 0)
+        self.parity = QComboBox()
+        self.parity.addItems(["なし", "偶数", "奇数"])
+        cfg_layout.addWidget(self.parity, row, 1)
+
+        cfg_layout.addWidget(QLabel("ストップビット:"), row, 2)
+        self.stop_bits = QComboBox()
+        self.stop_bits.addItems(["1", "1.5", "2"])
+        cfg_layout.addWidget(self.stop_bits, row, 3)
+
+        row += 1
+        cfg_layout.addWidget(QLabel("スレッショルド:"), row, 0)
+        self.threshold = QDoubleSpinBox()
+        self.threshold.setRange(-50.0, 50.0)
+        self.threshold.setValue(1.65)
+        self.threshold.setSingleStep(0.05)
+        self.threshold.setSuffix(" V")
+        cfg_layout.addWidget(self.threshold, row, 1)
+
+        self.btn_auto_thresh = QPushButton("自動")
+        self.btn_auto_thresh.setToolTip("選択チャネルの (Vmax+Vmin)/2 を自動設定")
+        self.btn_auto_thresh.clicked.connect(self._auto_threshold)
+        cfg_layout.addWidget(self.btn_auto_thresh, row, 2)
+
+        row += 1
+        self.btn_decode = QPushButton("デコード実行")
+        self.btn_decode.setEnabled(False)
+        self.btn_decode.clicked.connect(self._on_decode)
+        cfg_layout.addWidget(self.btn_decode, row, 0, 1, 4)
+
+        cfg_group.setLayout(cfg_layout)
+        layout.addWidget(cfg_group)
+
+        # 結果テーブル
+        res_group = QGroupBox("デコード結果")
+        res_layout = QVBoxLayout()
+
+        self.result_table = QTableWidget(0, 5)
+        self.result_table.setHorizontalHeaderLabels(["#", "時刻(s)", "HEX", "ASCII", "状態"])
+        self.result_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        self.result_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.result_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.result_table.setAlternatingRowColors(True)
+        res_layout.addWidget(self.result_table)
+
+        res_group.setLayout(res_layout)
+        layout.addWidget(res_group, stretch=1)
+
+        # ステータス
+        self.status_label = QLabel("波形を取得後にデコードしてください")
+        self.status_label.setWordWrap(True)
+        layout.addWidget(self.status_label)
+
+    def set_waveform(self, waveform: Optional[WaveformData]):
+        """デコード対象の波形を設定"""
+        self._current_waveform = waveform
+        self.btn_decode.setEnabled(waveform is not None)
+
+    def _auto_threshold(self):
+        """波形の中間電圧を自動設定"""
+        if self._current_waveform is None:
+            return
+
+        ch = 1 if self.channel.currentText() == "CH1" else 2
+        data = self._current_waveform.ch1_data if ch == 1 else self._current_waveform.ch2_data
+
+        if data is None:
+            self.status_label.setText("選択チャネルにデータがありません")
+            return
+
+        mid = (float(np.max(data)) + float(np.min(data))) / 2.0
+        self.threshold.setValue(round(mid, 3))
+
+    def _on_decode(self):
+        """デコード実行"""
+        if self._current_waveform is None:
+            return
+
+        ch = 1 if self.channel.currentText() == "CH1" else 2
+        data = self._current_waveform.ch1_data if ch == 1 else self._current_waveform.ch2_data
+
+        if data is None:
+            self.status_label.setText("選択チャネルにデータがありません")
+            return
+
+        parity_map = {"なし": "none", "偶数": "even", "奇数": "odd"}
+        stop_map = {"1": 1.0, "1.5": 1.5, "2": 2.0}
+
+        decoder = UARTDecoder(
+            baudrate=self.baudrate.currentData(),
+            data_bits=self.data_bits.currentData(),
+            parity=parity_map[self.parity.currentText()],
+            stop_bits=stop_map[self.stop_bits.currentText()],
+        )
+
+        try:
+            frames = decoder.decode(
+                self._current_waveform.time_array,
+                data,
+                threshold=self.threshold.value(),
+            )
+        except ValueError as e:
+            self.status_label.setText(f"エラー: {e}")
+            return
+
+        # テーブルを更新
+        self.result_table.setRowCount(len(frames))
+        for row_idx, frame in enumerate(frames):
+            items = [
+                str(row_idx),
+                f"{frame.start_time:.6f}",
+                frame.hex_str,
+                frame.ascii_str,
+                frame.status,
+            ]
+            for col, text in enumerate(items):
+                item = QTableWidgetItem(text)
+                if not frame.frame_ok or not frame.parity_ok:
+                    item.setForeground(QColor(255, 100, 100))
+                self.result_table.setItem(row_idx, col, item)
+
+        n = len(frames)
+        err = sum(1 for f in frames if not f.frame_ok or not f.parity_ok)
+        ok_bytes = bytes(f.data for f in frames if f.frame_ok)
+        preview = "".join(
+            chr(b) if 0x20 <= b <= 0x7E else ("↵" if b in (0x0A, 0x0D) else "·")
+            for b in ok_bytes[:60]
+        )
+
+        self.status_label.setText(
+            f"{n} フレーム検出  エラー: {err}"
+            + (f"\nASCII: {preview}" if preview else "")
+        )
+
+        self.decode_completed.emit(frames)
+        self.fit_waveform.emit(self._current_waveform)  # 波形全体を自動フィット
+
+
 class MainWindow(QMainWindow):
     """メインウィンドウ"""
 
@@ -1077,6 +1355,10 @@ class MainWindow(QMainWindow):
         self.logging_panel = LoggingPanel(self.data_logger)
         right_panel.addTab(self.logging_panel, "ロギング")
 
+        # デコードタブ
+        self.decode_panel = DecodePanel()
+        right_panel.addTab(self.decode_panel, "デコード")
+
         main_layout.addWidget(right_panel, stretch=1)
 
         # ステータスバー
@@ -1097,6 +1379,10 @@ class MainWindow(QMainWindow):
 
         self.history_panel.show_history.toggled.connect(self._on_history_toggled)
         self.history_panel.load_waveform.connect(self._on_load_saved_waveform)
+
+        # デコード結果をオーバーレイ表示し、波形全体を自動フィット
+        self.decode_panel.decode_completed.connect(self.plot_widget.show_decode_overlay)
+        self.decode_panel.fit_waveform.connect(self.plot_widget.fit_to_data)
 
         # タイムベース・V/div変更時にプロットを更新
         self.settings_panel.time_base.currentIndexChanged.connect(self._on_time_base_changed)
@@ -1134,8 +1420,10 @@ class MainWindow(QMainWindow):
         """波形データ受信"""
         self.current_waveform = waveform
         self.plot_widget.update_waveform(waveform)
+        self.plot_widget.clear_decode_overlay()
         self.measurement_panel.update_measurements(waveform)
         self.data_logger.history.add(waveform)
+        self.decode_panel.set_waveform(waveform)
 
         # 履歴スライダーの範囲更新
         self.history_panel.history_slider.setMaximum(len(self.data_logger.history) - 1)

@@ -158,6 +158,9 @@ class VDS1022Controller:
         self._sim_noise_level = 0.05
         self._sim_uart_baudrate = 9600
         self._sim_uart_message = b"Hello\r\n"
+        self._sim_i2c_address = 0x68   # スレーブアドレス（7bit）例: MPU-6050
+        self._sim_i2c_data = b'\x00\x01\x02'
+        self._sim_i2c_freq = 100000    # Hz (Standard=100kHz)
 
     def connect(self) -> bool:
         """オシロスコープに接続"""
@@ -419,22 +422,33 @@ class VDS1022Controller:
         ch1_data = None
         ch2_data = None
 
-        if self.ch1_enabled:
-            if self._sim_waveform == "uart":
-                ch1_data = self._generate_uart_signal(time_array)
-                ch1_data += np.random.normal(0, self._sim_noise_level * 0.1, num_samples)
-            else:
-                ch1_data = self._generate_waveform(time_array, self._sim_frequency,
-                                                    self._sim_amplitude, self._sim_waveform)
-                ch1_data += np.random.normal(0, self._sim_noise_level, num_samples)
-            ch1_data += self.offset_ch1
+        if self._sim_waveform == "i2c":
+            # I2C: CH1=SDA, CH2=SCL を同時生成
+            sda, scl = self._generate_i2c_signal(time_array)
+            noise = self._sim_noise_level * 0.05
+            if self.ch1_enabled:
+                ch1_data = sda + np.random.normal(0, noise, num_samples)
+                ch1_data += self.offset_ch1
+            if self.ch2_enabled:
+                ch2_data = scl + np.random.normal(0, noise, num_samples)
+                ch2_data += self.offset_ch2
+        else:
+            if self.ch1_enabled:
+                if self._sim_waveform == "uart":
+                    ch1_data = self._generate_uart_signal(time_array)
+                    ch1_data += np.random.normal(0, self._sim_noise_level * 0.1, num_samples)
+                else:
+                    ch1_data = self._generate_waveform(time_array, self._sim_frequency,
+                                                        self._sim_amplitude, self._sim_waveform)
+                    ch1_data += np.random.normal(0, self._sim_noise_level, num_samples)
+                ch1_data += self.offset_ch1
 
-        if self.ch2_enabled:
-            # CH2は異なる周波数・位相
-            ch2_data = self._generate_waveform(time_array, self._sim_frequency * 2,
-                                                self._sim_amplitude * 0.5, "square")
-            ch2_data += np.random.normal(0, self._sim_noise_level * 0.5, num_samples)
-            ch2_data += self.offset_ch2
+            if self.ch2_enabled:
+                # CH2は異なる周波数・位相
+                ch2_data = self._generate_waveform(time_array, self._sim_frequency * 2,
+                                                    self._sim_amplitude * 0.5, "square")
+                ch2_data += np.random.normal(0, self._sim_noise_level * 0.5, num_samples)
+                ch2_data += self.offset_ch2
 
         return WaveformData(
             timestamp=time.time(),
@@ -505,9 +519,98 @@ class VDS1022Controller:
 
         return signal
 
+    def _generate_i2c_signal(self, time_array: np.ndarray,
+                              v_high: float = 3.3, v_low: float = 0.0) -> tuple:
+        """
+        I2C信号を生成（シミュレーション用）
+
+        TTL I2C: 1ライトトランザクション（アドレス + データバイト列）を生成。
+        CH1=SDA, CH2=SCL として使用する。
+
+        Args:
+            time_array: 時間配列（秒）
+            v_high: HIGH電圧（V）
+            v_low: LOW電圧（V）
+
+        Returns:
+            (sda_array, scl_array): SDA信号とSCL信号の電圧配列
+        """
+        n = len(time_array)
+        sda = np.full(n, v_high, dtype=np.float64)
+        scl = np.full(n, v_high, dtype=np.float64)
+
+        freq = self._sim_i2c_freq
+        hp = 1.0 / (2.0 * freq)   # ハーフクロック周期
+
+        def set_sda(t0: float, t1: float, v: float):
+            if t0 >= time_array[-1]:
+                return
+            i0 = int(np.searchsorted(time_array, t0))
+            i1 = min(int(np.searchsorted(time_array, t1)), n)
+            if i0 < i1:
+                sda[i0:i1] = v
+
+        def set_scl(t0: float, t1: float, v: float):
+            if t0 >= time_array[-1]:
+                return
+            i0 = int(np.searchsorted(time_array, t0))
+            i1 = min(int(np.searchsorted(time_array, t1)), n)
+            if i0 < i1:
+                scl[i0:i1] = v
+
+        t = hp  # 1ハーフ周期アイドル
+
+        # START 条件: SDA 立ち下がり（SCL=H のまま）
+        set_sda(t, t + hp, v_low)
+        t += hp
+        # SCL 立ち下がり
+        set_scl(t, t + hp, v_low)
+        t += hp
+
+        # 送信バイト列: アドレスバイト（7bit addr << 1 | W=0）+ データ
+        address_byte = (self._sim_i2c_address << 1) | 0  # Write
+        all_bytes = [address_byte] + list(self._sim_i2c_data)
+
+        for byte_val in all_bytes:
+            if t >= time_array[-1]:
+                break
+            # 8ビット MSBファースト送信
+            for bit_pos in range(7, -1, -1):
+                if t >= time_array[-1]:
+                    break
+                bit_v = v_high if ((byte_val >> bit_pos) & 1) else v_low
+                # SCL LOW 期間: SDA セット
+                set_scl(t, t + hp, v_low)
+                set_sda(t, t + 2 * hp, bit_v)   # SDA は 1クロック周期保持
+                # SCL HIGH 期間: サンプリング
+                set_scl(t + hp, t + 2 * hp, v_high)
+                t += 2 * hp
+
+            if t >= time_array[-1]:
+                break
+            # ACK ビット（スレーブ = LOW）
+            set_scl(t, t + hp, v_low)
+            set_sda(t, t + 2 * hp, v_low)       # ACK = LOW
+            set_scl(t + hp, t + 2 * hp, v_high)
+            t += 2 * hp
+
+        # STOP 条件: SCL HIGH → SDA 立ち上がり
+        if t < time_array[-1]:
+            set_scl(t, t + hp, v_low)
+            set_sda(t, t + hp, v_low)     # SDA LOW を維持
+            t += hp
+            set_scl(t, t + hp, v_high)    # SCL HIGH
+            set_sda(t, t + hp, v_low)     # SDA まだ LOW
+            t += hp
+            set_sda(t, t + hp, v_high)    # SDA HIGH: STOP
+
+        return sda, scl
+
     def set_simulation_params(self, frequency: float = None, amplitude: float = None,
                               waveform: str = None, noise_level: float = None,
-                              uart_baudrate: int = None, uart_message: bytes = None):
+                              uart_baudrate: int = None, uart_message: bytes = None,
+                              i2c_address: int = None, i2c_data: bytes = None,
+                              i2c_freq: int = None):
         """シミュレーションパラメータを設定"""
         if frequency is not None:
             self._sim_frequency = frequency
@@ -521,6 +624,12 @@ class VDS1022Controller:
             self._sim_uart_baudrate = uart_baudrate
         if uart_message is not None:
             self._sim_uart_message = uart_message
+        if i2c_address is not None:
+            self._sim_i2c_address = i2c_address
+        if i2c_data is not None:
+            self._sim_i2c_data = i2c_data
+        if i2c_freq is not None:
+            self._sim_i2c_freq = i2c_freq
 
     def get_status(self) -> dict:
         """現在のステータスを取得"""

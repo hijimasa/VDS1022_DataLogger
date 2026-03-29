@@ -24,7 +24,7 @@ import numpy as np
 
 from oscilloscope import VDS1022Controller, WaveformData, TriggerMode, TriggerEdge, Coupling
 from data_logger import DataLogger
-from signal_decoder import UARTDecoder, UARTFrame
+from signal_decoder import UARTDecoder, UARTFrame, I2CDecoder, I2CFrame
 
 
 # pyqtgraph設定
@@ -297,7 +297,10 @@ class WaveformPlotWidget(pg.PlotWidget):
             self.cursor_h.hide()
 
     def show_decode_overlay(self, frames: List):
-        """デコード結果をオーバーレイ表示（波形上に色付き領域とラベル）"""
+        """デコード結果をオーバーレイ表示（波形上に色付き領域とラベル）
+
+        UART/I2C など共通インターフェース: frame.status / frame.overlay_label を使用。
+        """
         self.clear_decode_overlay()
 
         if not frames:
@@ -306,16 +309,20 @@ class WaveformPlotWidget(pg.PlotWidget):
         y_top = self._y_center + self._v_div * 3.5
 
         for frame in frames:
-            # フレーム種別に応じた色設定
-            if not frame.frame_ok:
-                region_color = (200, 60, 60, 60)   # 赤: フレームエラー
-                text_color = (255, 100, 100)
-            elif not frame.parity_ok:
-                region_color = (200, 150, 0, 60)    # 黄: パリティエラー
+            status = frame.status
+            # ステータスに応じた色設定
+            if status == 'OK':
+                region_color = (60, 200, 100, 60)    # 緑: 正常
+                text_color = (100, 255, 150)
+            elif status == 'START/STOP':
+                region_color = (60, 150, 255, 60)    # 青: START/STOP条件
+                text_color = (100, 200, 255)
+            elif 'NACK' in status:
+                region_color = (200, 150, 0, 60)     # 黄: NACK / パリティエラー
                 text_color = (255, 200, 0)
             else:
-                region_color = (60, 200, 100, 60)   # 緑: 正常
-                text_color = (100, 255, 150)
+                region_color = (200, 60, 60, 60)     # 赤: フレームエラー
+                text_color = (255, 100, 100)
 
             # 時間領域をハイライト
             region = pg.LinearRegionItem(
@@ -328,11 +335,10 @@ class WaveformPlotWidget(pg.PlotWidget):
             self.addItem(region)
             self._decode_items.append(region)
 
-            # HEX + ASCII ラベル
+            # ラベル（frame.overlay_label を使用）
             center_time = (frame.start_time + frame.end_time) / 2.0
-            label = f"{frame.hex_str}\n{frame.ascii_str}"
             text_item = pg.TextItem(
-                label,
+                frame.overlay_label,
                 color=pg.mkColor(*text_color),
                 anchor=(0.5, 1.0),
                 fill=pg.mkBrush(0, 0, 0, 160),
@@ -479,7 +485,7 @@ class SettingsPanel(QWidget):
 
         sim_layout.addWidget(QLabel("波形:"), 1, 0)
         self.sim_waveform = QComboBox()
-        self.sim_waveform.addItems(["sine", "square", "triangle", "sawtooth", "uart"])
+        self.sim_waveform.addItems(["sine", "square", "triangle", "sawtooth", "uart", "i2c"])
         self.sim_waveform.currentTextChanged.connect(self._on_sim_changed)
         self.sim_waveform.currentTextChanged.connect(self._on_waveform_type_changed)
         sim_layout.addWidget(self.sim_waveform, 1, 1)
@@ -517,6 +523,38 @@ class SettingsPanel(QWidget):
         self.uart_sim_group.setVisible(False)
         layout.addWidget(self.uart_sim_group)
 
+        # I2Cシミュレーション設定（i2c波形選択時のみ表示）
+        self.i2c_sim_group = QGroupBox("I2Cシミュレーション設定")
+        i2c_sim_layout = QGridLayout()
+
+        i2c_sim_layout.addWidget(QLabel("スレーブアドレス(7bit):"), 0, 0)
+        self.sim_i2c_address = QSpinBox()
+        self.sim_i2c_address.setRange(0, 127)
+        self.sim_i2c_address.setValue(0x68)  # MPU-6050
+        self.sim_i2c_address.setDisplayIntegerBase(16)
+        self.sim_i2c_address.setPrefix("0x")
+        self.sim_i2c_address.valueChanged.connect(self._on_sim_changed)
+        i2c_sim_layout.addWidget(self.sim_i2c_address, 0, 1)
+
+        i2c_sim_layout.addWidget(QLabel("クロック:"), 0, 2)
+        self.sim_i2c_freq = QComboBox()
+        for freq, lbl in [(100000, "100kHz (Standard)"),
+                          (400000, "400kHz (Fast)"),
+                          (1000000, "1MHz (Fast+)")]:
+            self.sim_i2c_freq.addItem(lbl, freq)
+        self.sim_i2c_freq.currentIndexChanged.connect(self._on_sim_changed)
+        i2c_sim_layout.addWidget(self.sim_i2c_freq, 0, 3)
+
+        i2c_sim_layout.addWidget(QLabel("データ(HEX):"), 1, 0)
+        self.sim_i2c_data = QLineEdit("00 01 02")
+        self.sim_i2c_data.setPlaceholderText("スペース区切り HEX (例: 00 01 02)")
+        self.sim_i2c_data.textChanged.connect(self._on_sim_changed)
+        i2c_sim_layout.addWidget(self.sim_i2c_data, 1, 1, 1, 3)
+
+        self.i2c_sim_group.setLayout(i2c_sim_layout)
+        self.i2c_sim_group.setVisible(False)
+        layout.addWidget(self.i2c_sim_group)
+
         layout.addStretch()
 
     def _on_ch1_enabled(self, enabled):
@@ -549,11 +587,18 @@ class SettingsPanel(QWidget):
     def _on_waveform_type_changed(self, waveform_type: str):
         """波形タイプ変更時のUI切替"""
         self.uart_sim_group.setVisible(waveform_type == "uart")
+        self.i2c_sim_group.setVisible(waveform_type == "i2c")
 
     def _on_sim_changed(self):
         # UARTメッセージのエスケープシーケンスを解釈
         raw_msg = self.sim_uart_message.text()
         uart_msg = raw_msg.replace("\\r\\n", "\r\n").replace("\\r", "\r").replace("\\n", "\n")
+
+        # I2Cデータ（スペース区切りHEX文字列をbytesに変換）
+        try:
+            i2c_data = bytes(int(x, 16) for x in self.sim_i2c_data.text().split() if x)
+        except ValueError:
+            i2c_data = b'\x00'
 
         self.controller.set_simulation_params(
             frequency=self.sim_freq.value(),
@@ -562,6 +607,9 @@ class SettingsPanel(QWidget):
             noise_level=self.sim_noise.value(),
             uart_baudrate=self.sim_uart_baudrate.currentData(),
             uart_message=uart_msg.encode('utf-8', errors='replace'),
+            i2c_address=self.sim_i2c_address.value(),
+            i2c_data=i2c_data,
+            i2c_freq=self.sim_i2c_freq.currentData(),
         )
 
 
@@ -1067,8 +1115,8 @@ class LoggingPanel(QWidget):
 
 
 class DecodePanel(QWidget):
-    """信号デコードパネル（UARTプロトコルデコード）"""
-    decode_completed = pyqtSignal(list)    # List[UARTFrame]
+    """信号デコードパネル（UART / I2C プロトコルデコード）"""
+    decode_completed = pyqtSignal(list)    # List[UARTFrame or I2CFrame]
     fit_waveform = pyqtSignal(object)      # デコード後に波形全体を自動フィット
 
     def __init__(self):
@@ -1079,71 +1127,129 @@ class DecodePanel(QWidget):
     def _init_ui(self):
         layout = QVBoxLayout(self)
 
-        # デコード設定
-        cfg_group = QGroupBox("デコード設定")
-        cfg_layout = QGridLayout()
+        # ---- プロトコル選択 ----
+        proto_layout = QHBoxLayout()
+        proto_layout.addWidget(QLabel("プロトコル:"))
+        self.protocol = QComboBox()
+        self.protocol.addItems(["UART", "I2C"])
+        self.protocol.currentTextChanged.connect(self._on_protocol_changed)
+        proto_layout.addWidget(self.protocol)
+        proto_layout.addStretch()
+        layout.addLayout(proto_layout)
+
+        # ---- UART 設定グループ ----
+        self.uart_cfg_group = QGroupBox("UART設定")
+        uart_layout = QGridLayout()
 
         row = 0
-        cfg_layout.addWidget(QLabel("プロトコル:"), row, 0)
-        self.protocol = QComboBox()
-        self.protocol.addItems(["UART"])
-        cfg_layout.addWidget(self.protocol, row, 1)
-
-        cfg_layout.addWidget(QLabel("チャネル:"), row, 2)
+        uart_layout.addWidget(QLabel("チャネル:"), row, 0)
         self.channel = QComboBox()
         self.channel.addItems(["CH1", "CH2"])
-        cfg_layout.addWidget(self.channel, row, 3)
+        uart_layout.addWidget(self.channel, row, 1)
 
-        row += 1
-        cfg_layout.addWidget(QLabel("ボーレート:"), row, 0)
+        uart_layout.addWidget(QLabel("ボーレート:"), row, 2)
         self.baudrate = QComboBox()
         for br in UARTDecoder.STANDARD_BAUDRATES:
             self.baudrate.addItem(str(br), br)
         self.baudrate.setCurrentText("9600")
-        cfg_layout.addWidget(self.baudrate, row, 1)
+        uart_layout.addWidget(self.baudrate, row, 3)
 
-        cfg_layout.addWidget(QLabel("データビット:"), row, 2)
+        row += 1
+        uart_layout.addWidget(QLabel("データビット:"), row, 0)
         self.data_bits = QComboBox()
         for db in [5, 6, 7, 8, 9]:
             self.data_bits.addItem(str(db), db)
         self.data_bits.setCurrentIndex(3)  # 8
-        cfg_layout.addWidget(self.data_bits, row, 3)
+        uart_layout.addWidget(self.data_bits, row, 1)
 
-        row += 1
-        cfg_layout.addWidget(QLabel("パリティ:"), row, 0)
+        uart_layout.addWidget(QLabel("パリティ:"), row, 2)
         self.parity = QComboBox()
         self.parity.addItems(["なし", "偶数", "奇数"])
-        cfg_layout.addWidget(self.parity, row, 1)
-
-        cfg_layout.addWidget(QLabel("ストップビット:"), row, 2)
-        self.stop_bits = QComboBox()
-        self.stop_bits.addItems(["1", "1.5", "2"])
-        cfg_layout.addWidget(self.stop_bits, row, 3)
+        uart_layout.addWidget(self.parity, row, 3)
 
         row += 1
-        cfg_layout.addWidget(QLabel("スレッショルド:"), row, 0)
+        uart_layout.addWidget(QLabel("ストップビット:"), row, 0)
+        self.stop_bits = QComboBox()
+        self.stop_bits.addItems(["1", "1.5", "2"])
+        uart_layout.addWidget(self.stop_bits, row, 1)
+
+        uart_layout.addWidget(QLabel("スレッショルド:"), row, 2)
         self.threshold = QDoubleSpinBox()
         self.threshold.setRange(-50.0, 50.0)
         self.threshold.setValue(1.65)
         self.threshold.setSingleStep(0.05)
         self.threshold.setSuffix(" V")
-        cfg_layout.addWidget(self.threshold, row, 1)
-
-        self.btn_auto_thresh = QPushButton("自動")
-        self.btn_auto_thresh.setToolTip("選択チャネルの (Vmax+Vmin)/2 を自動設定")
-        self.btn_auto_thresh.clicked.connect(self._auto_threshold)
-        cfg_layout.addWidget(self.btn_auto_thresh, row, 2)
+        uart_layout.addWidget(self.threshold, row, 3)
 
         row += 1
+        self.btn_auto_thresh = QPushButton("スレッショルド自動")
+        self.btn_auto_thresh.setToolTip("選択チャネルの (Vmax+Vmin)/2 を自動設定")
+        self.btn_auto_thresh.clicked.connect(self._auto_threshold)
+        uart_layout.addWidget(self.btn_auto_thresh, row, 0, 1, 4)
+
+        self.uart_cfg_group.setLayout(uart_layout)
+        layout.addWidget(self.uart_cfg_group)
+
+        # ---- I2C 設定グループ ----
+        self.i2c_cfg_group = QGroupBox("I2C設定")
+        i2c_layout = QGridLayout()
+
+        row = 0
+        i2c_layout.addWidget(QLabel("SDA チャネル:"), row, 0)
+        self.i2c_sda_ch = QComboBox()
+        self.i2c_sda_ch.addItems(["CH1", "CH2"])
+        i2c_layout.addWidget(self.i2c_sda_ch, row, 1)
+
+        i2c_layout.addWidget(QLabel("SCL チャネル:"), row, 2)
+        self.i2c_scl_ch = QComboBox()
+        self.i2c_scl_ch.addItems(["CH2", "CH1"])
+        i2c_layout.addWidget(self.i2c_scl_ch, row, 3)
+
+        row += 1
+        i2c_layout.addWidget(QLabel("SDA スレッショルド:"), row, 0)
+        self.i2c_sda_threshold = QDoubleSpinBox()
+        self.i2c_sda_threshold.setRange(-50.0, 50.0)
+        self.i2c_sda_threshold.setValue(1.65)
+        self.i2c_sda_threshold.setSingleStep(0.05)
+        self.i2c_sda_threshold.setSuffix(" V")
+        i2c_layout.addWidget(self.i2c_sda_threshold, row, 1)
+
+        self.btn_auto_sda = QPushButton("自動")
+        self.btn_auto_sda.setToolTip("SDAチャネルの (Vmax+Vmin)/2 を自動設定")
+        self.btn_auto_sda.clicked.connect(self._auto_sda_threshold)
+        i2c_layout.addWidget(self.btn_auto_sda, row, 2)
+
+        row += 1
+        i2c_layout.addWidget(QLabel("SCL スレッショルド:"), row, 0)
+        self.i2c_scl_threshold = QDoubleSpinBox()
+        self.i2c_scl_threshold.setRange(-50.0, 50.0)
+        self.i2c_scl_threshold.setValue(1.65)
+        self.i2c_scl_threshold.setSingleStep(0.05)
+        self.i2c_scl_threshold.setSuffix(" V")
+        i2c_layout.addWidget(self.i2c_scl_threshold, row, 1)
+
+        self.btn_auto_scl = QPushButton("自動")
+        self.btn_auto_scl.setToolTip("SCLチャネルの (Vmax+Vmin)/2 を自動設定")
+        self.btn_auto_scl.clicked.connect(self._auto_scl_threshold)
+        i2c_layout.addWidget(self.btn_auto_scl, row, 2)
+
+        row += 1
+        i2c_layout.addWidget(QLabel("アドレスフィルタ:"), row, 0)
+        self.i2c_addr_filter = QLineEdit()
+        self.i2c_addr_filter.setPlaceholderText("空欄=全表示 / 例: 0x68")
+        i2c_layout.addWidget(self.i2c_addr_filter, row, 1, 1, 3)
+
+        self.i2c_cfg_group.setLayout(i2c_layout)
+        self.i2c_cfg_group.setVisible(False)
+        layout.addWidget(self.i2c_cfg_group)
+
+        # ---- デコードボタン ----
         self.btn_decode = QPushButton("デコード実行")
         self.btn_decode.setEnabled(False)
         self.btn_decode.clicked.connect(self._on_decode)
-        cfg_layout.addWidget(self.btn_decode, row, 0, 1, 4)
+        layout.addWidget(self.btn_decode)
 
-        cfg_group.setLayout(cfg_layout)
-        layout.addWidget(cfg_group)
-
-        # 結果テーブル
+        # ---- 結果テーブル ----
         res_group = QGroupBox("デコード結果")
         res_layout = QVBoxLayout()
 
@@ -1158,38 +1264,106 @@ class DecodePanel(QWidget):
         res_group.setLayout(res_layout)
         layout.addWidget(res_group, stretch=1)
 
-        # ステータス
+        # ---- ステータス ----
         self.status_label = QLabel("波形を取得後にデコードしてください")
         self.status_label.setWordWrap(True)
         layout.addWidget(self.status_label)
+
+    # ------------------------------------------------------------------
+    # プロトコル切替
+    # ------------------------------------------------------------------
+
+    def _on_protocol_changed(self, protocol: str):
+        """プロトコル変更時: 設定グループとテーブル列を切替"""
+        is_uart = protocol == "UART"
+        self.uart_cfg_group.setVisible(is_uart)
+        self.i2c_cfg_group.setVisible(not is_uart)
+        self._setup_table_columns(protocol)
+
+    def _setup_table_columns(self, protocol: str):
+        """テーブル列をプロトコルに合わせて再設定"""
+        self.result_table.clearContents()
+        self.result_table.setRowCount(0)
+        if protocol == "UART":
+            self.result_table.setColumnCount(5)
+            self.result_table.setHorizontalHeaderLabels(["#", "時刻(s)", "HEX", "ASCII", "状態"])
+            self.result_table.horizontalHeader().setSectionResizeMode(
+                4, QHeaderView.ResizeMode.Stretch)
+        elif protocol == "I2C":
+            self.result_table.setColumnCount(6)
+            self.result_table.setHorizontalHeaderLabels(
+                ["#", "種別", "時刻(s)", "アドレス/データ", "R/W", "ACK"])
+            self.result_table.horizontalHeader().setSectionResizeMode(
+                3, QHeaderView.ResizeMode.Stretch)
+
+    # ------------------------------------------------------------------
+    # 公開メソッド
+    # ------------------------------------------------------------------
 
     def set_waveform(self, waveform: Optional[WaveformData]):
         """デコード対象の波形を設定"""
         self._current_waveform = waveform
         self.btn_decode.setEnabled(waveform is not None)
 
+    # ------------------------------------------------------------------
+    # スレッショルド自動設定
+    # ------------------------------------------------------------------
+
     def _auto_threshold(self):
-        """波形の中間電圧を自動設定"""
+        """UART: 選択チャネルの中間電圧を自動設定"""
         if self._current_waveform is None:
             return
-
         ch = 1 if self.channel.currentText() == "CH1" else 2
         data = self._current_waveform.ch1_data if ch == 1 else self._current_waveform.ch2_data
-
         if data is None:
             self.status_label.setText("選択チャネルにデータがありません")
             return
-
         mid = (float(np.max(data)) + float(np.min(data))) / 2.0
         self.threshold.setValue(round(mid, 3))
 
-    def _on_decode(self):
-        """デコード実行"""
+    def _auto_sda_threshold(self):
+        """I2C SDA: 選択チャネルの中間電圧を自動設定"""
         if self._current_waveform is None:
             return
-
-        ch = 1 if self.channel.currentText() == "CH1" else 2
+        ch = 1 if self.i2c_sda_ch.currentText() == "CH1" else 2
         data = self._current_waveform.ch1_data if ch == 1 else self._current_waveform.ch2_data
+        if data is None:
+            self.status_label.setText("SDAチャネルにデータがありません")
+            return
+        mid = (float(np.max(data)) + float(np.min(data))) / 2.0
+        self.i2c_sda_threshold.setValue(round(mid, 3))
+
+    def _auto_scl_threshold(self):
+        """I2C SCL: 選択チャネルの中間電圧を自動設定"""
+        if self._current_waveform is None:
+            return
+        ch = 1 if self.i2c_scl_ch.currentText() == "CH1" else 2
+        data = self._current_waveform.ch1_data if ch == 1 else self._current_waveform.ch2_data
+        if data is None:
+            self.status_label.setText("SCLチャネルにデータがありません")
+            return
+        mid = (float(np.max(data)) + float(np.min(data))) / 2.0
+        self.i2c_scl_threshold.setValue(round(mid, 3))
+
+    # ------------------------------------------------------------------
+    # デコード実行
+    # ------------------------------------------------------------------
+
+    def _on_decode(self):
+        """プロトコルに応じてデコードを実行"""
+        if self._current_waveform is None:
+            return
+        protocol = self.protocol.currentText()
+        if protocol == "UART":
+            self._decode_uart()
+        elif protocol == "I2C":
+            self._decode_i2c()
+
+    def _decode_uart(self):
+        """UARTデコード実行"""
+        wf = self._current_waveform
+        ch = 1 if self.channel.currentText() == "CH1" else 2
+        data = wf.ch1_data if ch == 1 else wf.ch2_data
 
         if data is None:
             self.status_label.setText("選択チャネルにデータがありません")
@@ -1206,26 +1380,18 @@ class DecodePanel(QWidget):
         )
 
         try:
-            frames = decoder.decode(
-                self._current_waveform.time_array,
-                data,
-                threshold=self.threshold.value(),
-            )
+            frames = decoder.decode(wf.time_array, data, threshold=self.threshold.value())
         except ValueError as e:
             self.status_label.setText(f"エラー: {e}")
             return
 
-        # テーブルを更新
+        # テーブル更新
+        self._setup_table_columns("UART")
         self.result_table.setRowCount(len(frames))
         for row_idx, frame in enumerate(frames):
-            items = [
-                str(row_idx),
-                f"{frame.start_time:.6f}",
-                frame.hex_str,
-                frame.ascii_str,
-                frame.status,
-            ]
-            for col, text in enumerate(items):
+            vals = [str(row_idx), f"{frame.start_time:.6f}",
+                    frame.hex_str, frame.ascii_str, frame.status]
+            for col, text in enumerate(vals):
                 item = QTableWidgetItem(text)
                 if not frame.frame_ok or not frame.parity_ok:
                     item.setForeground(QColor(255, 100, 100))
@@ -1238,14 +1404,99 @@ class DecodePanel(QWidget):
             chr(b) if 0x20 <= b <= 0x7E else ("↵" if b in (0x0A, 0x0D) else "·")
             for b in ok_bytes[:60]
         )
-
         self.status_label.setText(
             f"{n} フレーム検出  エラー: {err}"
             + (f"\nASCII: {preview}" if preview else "")
         )
-
         self.decode_completed.emit(frames)
-        self.fit_waveform.emit(self._current_waveform)  # 波形全体を自動フィット
+        self.fit_waveform.emit(wf)
+
+    def _decode_i2c(self):
+        """I2Cデコード実行"""
+        wf = self._current_waveform
+        sda_ch = 1 if self.i2c_sda_ch.currentText() == "CH1" else 2
+        scl_ch = 1 if self.i2c_scl_ch.currentText() == "CH1" else 2
+
+        sda_data = wf.ch1_data if sda_ch == 1 else wf.ch2_data
+        scl_data = wf.ch1_data if scl_ch == 1 else wf.ch2_data
+
+        if sda_data is None:
+            self.status_label.setText(
+                f"SDA (CH{sda_ch}) にデータがありません。CH2を有効にしてください。")
+            return
+        if scl_data is None:
+            self.status_label.setText(
+                f"SCL (CH{scl_ch}) にデータがありません。CH2を有効にしてください。")
+            return
+        if sda_ch == scl_ch:
+            self.status_label.setText("SDAとSCLに異なるチャネルを選択してください")
+            return
+
+        decoder = I2CDecoder()
+        try:
+            frames = decoder.decode(
+                wf.time_array, sda_data, scl_data,
+                sda_threshold=self.i2c_sda_threshold.value(),
+                scl_threshold=self.i2c_scl_threshold.value(),
+            )
+        except ValueError as e:
+            self.status_label.setText(f"エラー: {e}")
+            return
+
+        # アドレスフィルタ
+        addr_filter_text = self.i2c_addr_filter.text().strip()
+        addr_filter = None
+        if addr_filter_text:
+            try:
+                addr_filter = int(addr_filter_text, 0)  # 0x68 や 104 など
+            except ValueError:
+                pass
+
+        # テーブル更新
+        self._setup_table_columns("I2C")
+        display_frames = []
+        for frame in frames:
+            if addr_filter is not None and frame.frame_type == 'address':
+                if frame.data != addr_filter:
+                    continue
+            display_frames.append(frame)
+
+        self.result_table.setRowCount(len(display_frames))
+        for row_idx, frame in enumerate(display_frames):
+            rw_str = 'R' if frame.is_read else 'W'
+            ack_str = 'ACK' if frame.ack else 'NAK'
+
+            if frame.frame_type in ('start', 'restart'):
+                vals = [str(row_idx), 'START' if frame.frame_type == 'start' else 'RS',
+                        f"{frame.start_time:.6f}", '', '', '']
+            elif frame.frame_type == 'stop':
+                vals = [str(row_idx), 'STOP', f"{frame.start_time:.6f}", '', '', '']
+            elif frame.frame_type == 'address':
+                vals = [str(row_idx), 'ADDR', f"{frame.start_time:.6f}",
+                        f"0x{frame.data:02X}", rw_str, ack_str]
+            else:  # data
+                vals = [str(row_idx), 'DATA', f"{frame.start_time:.6f}",
+                        f"{frame.hex_str}  {frame.ascii_str}", '', ack_str]
+
+            for col, text in enumerate(vals):
+                item = QTableWidgetItem(text)
+                status = frame.status
+                if 'NACK' in status:
+                    item.setForeground(QColor(255, 200, 0))
+                elif status not in ('OK', 'START/STOP'):
+                    item.setForeground(QColor(255, 100, 100))
+                self.result_table.setItem(row_idx, col, item)
+
+        # サマリ
+        addr_frames = [f for f in frames if f.frame_type == 'address']
+        data_frames = [f for f in frames if f.frame_type == 'data']
+        nacks = sum(1 for f in frames if f.frame_type in ('address', 'data') and not f.ack)
+        self.status_label.setText(
+            f"{len(frames)} フレーム  "
+            f"ADDR:{len(addr_frames)}  DATA:{len(data_frames)}  NACK:{nacks}"
+        )
+        self.decode_completed.emit(frames)
+        self.fit_waveform.emit(wf)
 
 
 class MainWindow(QMainWindow):
